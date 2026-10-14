@@ -1,0 +1,7 @@
+﻿streamlit>=1.65
+pandas
+numpy
+altair
+requests
+xlsxwriter
+plotly

@@ -1,0 +1,20 @@
+﻿.streamlit/secrets.toml
+.brightdata_cache*
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+*.csv
+*.xlsx
+*.xls
+*.xlsm
+
+# File lokal dan cache
+app-publish - Copy.py
+.brightdata_cache*
+.streamlit/secrets.toml
