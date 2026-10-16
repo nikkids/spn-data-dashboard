@@ -625,7 +625,7 @@ def _live_block(r, store, plat, label, hcol, ocol):
 def render_live(r):
     st.markdown('<div class="sec">Follower terbaru</div>', unsafe_allow_html=True)
     if not bd_key():
-        st.caption("Isi BRIGHTDATA_API_KEY di .streamlit/secrets.toml untuk mengaktifkan fitur ini.")
+        st.caption("")
         return
     store = bd_load()
     for spec in LIVE_PLATFORMS:
