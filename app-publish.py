@@ -55,19 +55,19 @@ LOGO_PATH = Path(__file__).parent / "logo-spn.jpeg"
 LOGO_WIDE_PATH = Path(__file__).parent / "logo-spn-landscape.png"
 
 
-def _insert_excel_logo(ws, cell: str = "B1") -> bool:
-    """Sematkan logo SPN ke workbook Excel (gambar tertanam di dalam .xlsx)."""
+def _insert_excel_logo(ws, cell: str = "B2") -> bool:
+    """Sematkan logo SPN berukuran menonjol ke workbook Excel hasil ekspor."""
     logo_file = LOGO_WIDE_PATH if LOGO_WIDE_PATH.is_file() else LOGO_PATH
     if not logo_file.is_file():
         return False
 
-    # Sisakan ruang di header agar logo tidak bertumpuk dengan judul.
-    # Lebar maksimum 132 px dan tinggi maksimum 43 px, proporsi gambar dipertahankan.
+    # Logo berfungsi sebagai elemen brand/subtitle yang jelas, bukan watermark kecil.
+    # Batas 250 x 72 px; rasio gambar selalu dipertahankan.
     options = {
         "object_position": 1,
         "description": "Logo Smart Parents Network",
         "x_offset": 4,
-        "y_offset": 3,
+        "y_offset": 2,
     }
     try:
         from PIL import Image
@@ -75,14 +75,14 @@ def _insert_excel_logo(ws, cell: str = "B1") -> bool:
         with Image.open(logo_file) as image_file:
             image_width, image_height = image_file.size
         if image_width > 0 and image_height > 0:
-            scale = min(132 / image_width, 43 / image_height)
+            scale = min(250 / image_width, 72 / image_height)
             options["x_scale"] = scale
             options["y_scale"] = scale
         else:
-            options.update({"x_scale": 0.25, "y_scale": 0.25})
+            options.update({"x_scale": 0.45, "y_scale": 0.45})
     except Exception:
         # Fallback aman jika Pillow tidak tersedia atau metadata gambar tidak terbaca.
-        options.update({"x_scale": 0.25, "y_scale": 0.25})
+        options.update({"x_scale": 0.45, "y_scale": 0.45})
 
     ws.insert_image(cell, str(logo_file), options)
     return True
@@ -910,15 +910,19 @@ def _write_dashboard(book, ws, raw: pd.DataFrame, filters: list) -> None:
         "num_format": "#,##0",
     })
 
-    # Area B:C dikosongkan khusus untuk logo. Judul dan subtitle dimulai dari kolom D
-    # agar gambar tidak menimpa teks ketika workbook dibuka atau dicetak.
-    ws.merge_range(0, 3, 0, 20, "SPN DATA EXPLORER  |  DASHBOARD", title)
+    # Header dibuat dua tingkat: judul utama di atas, lalu logo SPN berukuran besar
+    # sebagai brand/subtitle di kiri. Informasi filter berada di kanan logo.
+    ws.merge_range(0, 1, 0, 20, "SPN DATA EXPLORER  |  DASHBOARD", title)
     ws.set_row(0, 39)
     filter_text = "; ".join(filters) if filters else "Semua data"
-    ws.merge_range(1, 3, 1, 20, f"Ringkasan hasil ekspor  •  Filter aktif: {filter_text}", subtitle)
-    ws.set_row(1, 29)
+    ws.merge_range(
+        1, 5, 1, 20,
+        f"Ringkasan hasil ekspor\nFilter aktif: {filter_text}",
+        subtitle,
+    )
+    ws.set_row(1, 60)
     ws.set_row(2, 9)
-    _insert_excel_logo(ws, "B1")
+    _insert_excel_logo(ws, "B2")
 
     if raw.empty:
         empty_fmt = book.add_format({
