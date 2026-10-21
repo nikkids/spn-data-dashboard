@@ -12,33 +12,24 @@ Alat penjelajah data berbasis pencarian untuk master_penting.csv, dibagi menjadi
 
 Filter di sidebar berlaku di semua halaman.
 
-Jalankan:  pip install -U streamlit pandas altair xlsxwriter requests plotly
+Jalankan:  pip install -U streamlit pandas altair xlsxwriter plotly
            streamlit run app.py
 
 Letakkan master_penting.csv dan folder .streamlit (berisi config.toml) di samping file ini.
 Plotly opsional: tanpa plotly, grafik interaktif/3D otomatis diganti grafik Altair biasa.
-
-Follower real-time (opsional, Bright Data): simpan API key di .streamlit/secrets.toml
-    BRIGHTDATA_API_KEY = "isi-key-anda"
-atau di variabel lingkungan BRIGHTDATA_API_KEY. Jangan menulis key langsung di kode.
 """
+import base64
 import functools
 import html
 import io
-import json
-import os
 import re
-import threading
-import time
 import traceback
 from contextlib import contextmanager
-from datetime import date
 from pathlib import Path
 
 import altair as alt
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 
 try:
@@ -57,7 +48,25 @@ except ImportError:
 
 alt.data_transformers.disable_max_rows()
 
-st.set_page_config(page_title="SPN Data Explorer", page_icon=":material/monitoring:", layout="wide")
+# Logo SPN, letakkan di samping file ini:
+#   logo-spn.jpeg            ikon tab dan logo di samping judul tiap halaman
+#   logo-spn-landscape.png   logo panjang di sidebar/header
+LOGO_PATH = Path(__file__).parent / "logo-spn.jpeg"
+LOGO_WIDE_PATH = Path(__file__).parent / "logo-spn-landscape.png"
+
+
+def _load_logo():
+    try:
+        from PIL import Image
+
+        return Image.open(LOGO_PATH)
+    except Exception:  # file belum ada atau tidak terbaca: pakai ikon bawaan
+        return None
+
+
+st.set_page_config(page_title="SPN Data Explorer", page_icon=_load_logo() or ":material/monitoring:", layout="wide")
+if LOGO_WIDE_PATH.exists():
+    st.logo(str(LOGO_WIDE_PATH), size="large")
 
 MIN_STREAMLIT = (1, 65)  # versi tempat aplikasi ini dibuat dan diuji
 
@@ -75,8 +84,8 @@ if _version(st.__version__) < MIN_STREAMLIT:
 
 CSV_PATH = "master_penting_3.csv"
 
-BLUE = "#2596BE"
-BLUE_MUTED = "#1B5F7A"
+BLUE = "#4A7CD9"
+BLUE_MUTED = "#2F5FC0"
 
 TIER_ORDER = ["<1K", "Nano", "Mikro", "Makro"]
 CHILD_ORDER = [
@@ -92,10 +101,12 @@ MONTHS_ID = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt
 # ============================================================ TAMPILAN (CSS)
 CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap');
 :root {
-  --bg: #0A171E; --panel: #0F2029; --panel-2: #132B36; --line: #1C3A47; --line-2: #29536A;
-  --text: #E4F0F5; --muted: #8FAAB8; --faint: #6B8A99;
-  --blue: #2596BE; --blue-hi: #6CC8E6; --blue-soft: rgba(37, 150, 190, 0.16);
+  --bg: #FFFFFF; --panel: #F6F8FE; --panel-2: #FFFFFF; --line: #DCE4F5; --line-2: #BFCCEC;
+  --text: #1A1464; --muted: #55608A; --faint: #69759F;
+  --blue: #4A7CD9; --blue-hi: #2F5FC0; --blue-soft: rgba(74, 124, 217, 0.12);
+  --pink: #D91A7D; --pink-hi: #B8136A; --navy: #1A1464;
 }
 
 /* elemen CSS tidak boleh menyisakan ruang kosong */
@@ -103,7 +114,15 @@ CSS = """
 
 /* header bawaan Streamlit (tempat menu halaman di bagian atas) */
 [data-testid="stAppDeployButton"] { display: none; }
-[data-testid="stHeader"] { background: var(--bg); border-bottom: 1px solid var(--line); }
+[data-testid="stHeader"] { background: var(--blue); border-bottom: 0; }
+[data-testid="stHeader"], [data-testid="stHeader"] * { color: #fff; }
+[data-testid="stHeader"] a, [data-testid="stHeader"] button { border-radius: 999px; font-weight: 600; }
+/* logo di samping judul halaman */
+.page-head { display: flex; align-items: center; gap: 1rem; }
+.page-logo { height: 3.2rem; width: auto; border-radius: 12px; display: block; flex: none; }
+[data-testid="stHeader"] a:hover, [data-testid="stHeader"] button:hover { background: rgba(255, 255, 255, 0.16); }
+[data-testid="stHeader"] [aria-current="page"] { background: #fff; }
+[data-testid="stHeader"] [aria-current="page"], [data-testid="stHeader"] [aria-current="page"] * { color: var(--navy); }
 
 /* kanvas utama */
 [data-testid="stMainBlockContainer"] { padding: 4.6rem 2.6rem 3rem; max-width: 1600px; }
@@ -126,11 +145,11 @@ CSS = """
 [data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-primary"], [data-testid="stBaseButton-tertiary"] {
   font-size: 0.86rem; font-weight: 550; min-height: 2.35rem; box-shadow: none; transition: border-color .12s, background .12s;
 }
-[data-testid="stBaseButton-secondary"] { background: transparent; border: 1px solid var(--line-2); color: var(--text); }
+[data-testid="stBaseButton-secondary"] { background: transparent; border: 1.5px solid var(--navy); color: var(--navy); border-radius: 999px; }
 [data-testid="stBaseButton-secondary"]:hover:not(:disabled) { border-color: var(--blue); background: var(--blue-soft); color: var(--text); }
 [data-testid="stBaseButton-secondary"]:disabled { opacity: 0.4; }
-[data-testid="stBaseButton-primary"] { background: var(--blue); border: 1px solid var(--blue); color: #fff; }
-[data-testid="stBaseButton-primary"]:hover:not(:disabled) { background: #3AA8CF; border-color: #3AA8CF; }
+[data-testid="stBaseButton-primary"] { background: var(--pink); border: 1px solid var(--pink); color: #fff; border-radius: 999px; }
+[data-testid="stBaseButton-primary"]:hover:not(:disabled) { background: var(--pink-hi); border-color: var(--pink-hi); }
 [data-testid="stBaseButton-tertiary"] { color: var(--muted); }
 [data-testid="stBaseButton-tertiary"]:hover:not(:disabled) { color: var(--text); background: var(--blue-soft); }
 [data-testid="stBaseButton-tertiary"]:disabled { opacity: 0.35; }
@@ -139,9 +158,9 @@ CSS = """
 .st-key-chips { gap: 0.4rem; }
 .st-key-chips [data-testid="stBaseButton-secondary"] {
   min-height: 1.85rem; padding: 0.1rem 0.65rem 0.1rem 0.55rem; font-size: 0.8rem; font-weight: 500;
-  background: var(--blue-soft); border: 1px solid rgba(37, 150, 190, 0.45); color: var(--blue-hi);
+  background: var(--blue-soft); border: 1px solid rgba(47, 95, 192, 0.45); color: var(--blue-hi);
 }
-.st-key-chips [data-testid="stBaseButton-secondary"]:hover { background: rgba(37, 150, 190, 0.28); border-color: var(--blue); color: #fff; }
+.st-key-chips [data-testid="stBaseButton-secondary"]:hover { background: rgba(47, 95, 192, 0.28); border-color: var(--blue); color: var(--text); }
 
 /* kolom pencarian */
 [data-testid="stTextInput"] input { font-size: 0.95rem; }
@@ -186,10 +205,10 @@ CSS = """
 .brand-lg b { font-family: "SPNBrands", sans-serif; font-weight: 400; font-size: 1.1rem; margin-right: 0.4rem; vertical-align: -0.12em; }
 
 /* tabel */
-[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
 
 /* panel detail */
-.st-key-inspector { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1.1rem 1.15rem; }
+.st-key-inspector { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 1.1rem 1.15rem; }
 .st-key-inspector [data-testid="stVerticalBlock"] { gap: 0.55rem; }
 .rec-name { font-size: 1.2rem; font-weight: 650; letter-spacing: -0.012em; line-height: 1.25; overflow-wrap: anywhere; }
 .rec-meta { font-size: 0.78rem; color: var(--muted); margin-top: 0.25rem; font-variant-numeric: tabular-nums; }
@@ -205,18 +224,13 @@ CSS = """
 .kv a:hover, .row-link a:hover { text-decoration: underline; }
 .row-link { display: flex; justify-content: space-between; align-items: baseline; font-size: 0.88rem; margin-top: 0.2rem; }
 .row-link .k { color: var(--muted); }
-.warn { color: #E7A36A; }
 .dim { color: var(--faint); }
 .tags { display: flex; flex-wrap: wrap; gap: 0.35rem; padding-top: 0.45rem; }
-.tag { font-size: 0.76rem; padding: 0.15rem 0.55rem; border-radius: 4px; background: var(--blue-soft); color: var(--blue-hi); }
+.tag { font-size: 0.76rem; padding: 0.15rem 0.55rem; border-radius: 999px; background: var(--blue-soft); color: var(--blue-hi); }
 .dup { display: grid; grid-template-columns: 3.2rem 1fr auto; gap: 0.6rem; font-size: 0.8rem; color: var(--muted); padding: 0.25rem 0; }
 .dup span:last-child { font-variant-numeric: tabular-nums; }
 .st-key-inspector [data-testid="stCode"] pre { font-size: 0.85rem; padding: 0.45rem 0.7rem; }
 .empty-title { font-size: 0.95rem; font-weight: 600; }
-.live-num { font-size: 1.15rem; font-weight: 650; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
-.live-meta { font-size: 0.78rem; color: var(--muted); font-variant-numeric: tabular-nums; }
-.up { color: #6FBF8E; }
-.down { color: #E7A36A; }
 
 /* tombol "Show data" bawaan pada grafik disembunyikan: tampilan tabelnya menutupi toolbar sehingga tidak bisa kembali ke grafik */
 [data-testid="stElementToolbarButton"]:has(button[aria-label="Show data"]) { display: none; }
@@ -245,10 +259,18 @@ CSS = """
 
 /* kartu angka ringkasan */
 .kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; margin-bottom: 1.1rem; }
-.kpi { background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--blue); border-radius: 8px; padding: 0.95rem 1.1rem 1rem; min-width: 0; }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--blue); border-radius: 16px; padding: 0.95rem 1.1rem 1rem; min-width: 0; }
 .kpi .l { font-size: 0.74rem; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
 .kpi .n { font-size: 1.6rem; font-weight: 650; letter-spacing: -0.02em; line-height: 1.2; margin-top: 0.15rem; font-variant-numeric: tabular-nums; }
 .kpi .s { font-size: 0.78rem; color: var(--muted); margin-top: 0.1rem; }
+
+/* gaya SPN: Poppins, judul tebal, kartu angka berwarna */
+[data-testid="stApp"] { font-family: "Poppins", system-ui, sans-serif; }
+.page-title { font-size: 1.7rem; font-weight: 800; letter-spacing: -0.02em; color: var(--navy); }
+.section-title { font-weight: 700; color: var(--navy); }
+.kpi { border-top-color: var(--pink); box-shadow: 0 2px 10px rgba(26, 20, 100, 0.05); }
+.kpi .n { color: var(--navy); font-weight: 800; }
+[data-testid="stSidebar"] { box-shadow: 2px 0 12px rgba(26, 20, 100, 0.04); }
 
 @media (max-width: 1250px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 900px) {
@@ -364,279 +386,6 @@ def safe_section(title: str):
         show_fallback(title, exc)
 
 
-# ============================================================ FOLLOWER TERBARU (Bright Data)
-# Dirancang hemat kredit:
-#  1. Tidak ada panggilan otomatis. Satu klik = satu akun = satu platform. Memilih baris tidak memanggil API.
-#  2. Hasil disimpan di disk, dipakai bersama semua sesi dan bertahan setelah aplikasi dimulai ulang.
-#  3. Selama masih segar (default 24 jam), akun yang sama tidak diambil lagi. Mengambil ulang perlu konfirmasi.
-#  4. Akun tidak ditemukan juga disimpan (12 jam) agar tidak dibayar berulang.
-#  5. Handle yang jelas tidak valid tidak pernah dikirim.
-#  6. Batas harian keras (default 50 permintaan).
-#  7. Jika Bright Data lambat, ID snapshot disimpan: klik berikutnya melanjutkan, bukan memicu ulang.
-#  8. Dua klik bersamaan pada akun yang sama hanya menjadi satu permintaan.
-BD_BASE = "https://api.brightdata.com/datasets/v3"
-BD_DEFAULT_DATASETS = {"ig": "gd_l1vikfch901nx3by4", "tt": "gd_l1villgoiiidt09ci"}
-BD_CACHE_FILE = Path(".brightdata_cache.json")
-BD_WAIT_SECONDS = 75
-BD_MISS_TTL_HOURS = 12
-BD_PENDING_MAX_SECONDS = 3600
-HANDLE_RE = {"ig": re.compile(r"^[A-Za-z0-9._]{1,30}$"), "tt": re.compile(r"^[A-Za-z0-9._]{1,24}$")}
-BD_MESSAGES = {
-    "auth": "API key ditolak Bright Data. Periksa BRIGHTDATA_API_KEY.",
-    "ratelimit": "Bright Data membatasi permintaan. Coba lagi beberapa saat.",
-    "limit": "Batas harian tercapai. Naikkan BRIGHTDATA_DAILY_LIMIT jika memang perlu.",
-    "busy": "Akun ini sedang diambil oleh sesi lain.",
-    "pending": "Masih diproses Bright Data. Klik Cek hasil sebentar lagi, tidak dikenai permintaan baru.",
-    "invalid": "Nama akun tidak valid, tidak dikirim ke Bright Data.",
-    "nokey": "API key belum diatur.",
-}
-
-
-def _cfg(name: str, default=""):
-    try:
-        val = st.secrets.get(name)
-    except Exception:
-        val = None
-    return val if val not in (None, "") else os.environ.get(name, default)
-
-
-def bd_key() -> str:
-    return str(_cfg("BRIGHTDATA_API_KEY", "")).strip()
-
-
-def bd_num(name: str, default) -> float:
-    try:
-        return float(_cfg(name, default))
-    except (TypeError, ValueError):
-        return float(default)
-
-
-@st.cache_resource
-def _bd_state():
-    return {"lock": threading.Lock(), "inflight": set()}
-
-
-def bd_load() -> dict:
-    try:
-        data = json.loads(BD_CACHE_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data.setdefault("entries", {})
-            data.setdefault("usage", {})
-            return data
-    except Exception:
-        pass
-    return {"entries": {}, "usage": {}}
-
-
-def bd_save(store: dict):
-    keep = sorted(store["usage"])[-7:]
-    store["usage"] = {k: store["usage"][k] for k in keep}
-    tmp = BD_CACHE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, BD_CACHE_FILE)
-
-
-def bd_update(fn):
-    with _bd_state()["lock"]:
-        store = bd_load()
-        fn(store)
-        bd_save(store)
-
-
-def bd_fresh(ent) -> bool:
-    if not ent:
-        return False
-    age_h = (time.time() - ent.get("at", 0)) / 3600
-    if ent.get("status") == "ok":
-        return age_h < bd_num("BRIGHTDATA_TTL_HOURS", 24)
-    if ent.get("status") == "missing":
-        return age_h < BD_MISS_TTL_HOURS
-    return False
-
-
-def bd_pending(ent) -> bool:
-    return bool(ent) and ent.get("status") == "pending" and time.time() - ent.get("at", 0) < BD_PENDING_MAX_SECONDS
-
-
-def _json_body(resp):
-    try:
-        return resp.json()
-    except ValueError:
-        rows = []
-        for line in resp.text.splitlines():
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                pass
-        return rows
-
-
-def _parse_followers(payload):
-    recs = payload if isinstance(payload, list) else [payload]
-    for rec in recs:
-        if not isinstance(rec, dict):
-            continue
-        for k in ("followers", "followers_count", "follower_count"):
-            v = rec.get(k)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                return int(v)
-            if isinstance(v, str) and v.strip().isdigit():
-                return int(v.strip())
-    return None
-
-
-def bd_fetch(plat: str, handle: str, force: bool = False) -> dict:
-    """Satu-satunya fungsi yang menyentuh API berbayar. Mengembalikan {"status": ...}."""
-    key = bd_key()
-    if not key:
-        return {"status": "nokey"}
-    if not HANDLE_RE[plat].match(handle or ""):
-        return {"status": "invalid"}
-    ck = f"{plat}:{handle.lower()}"
-    state = _bd_state()
-    today = date.today().isoformat()
-
-    with state["lock"]:
-        store = bd_load()
-        ent = store["entries"].get(ck)
-        if not force and bd_fresh(ent):
-            return {"status": "cached"}
-        if ck in state["inflight"]:
-            return {"status": "busy"}
-        snapshot = ent.get("snapshot_id") if bd_pending(ent) else None
-        if not snapshot and store["usage"].get(today, 0) >= int(bd_num("BRIGHTDATA_DAILY_LIMIT", 50)):
-            return {"status": "limit"}
-        state["inflight"].add(ck)
-
-    try:
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        payload = None
-        if not snapshot:
-            url = f"https://www.instagram.com/{handle}/" if plat == "ig" else f"https://www.tiktok.com/@{handle}"
-            dataset = _cfg(f"BRIGHTDATA_DATASET_{plat.upper()}", BD_DEFAULT_DATASETS[plat])
-            resp = requests.post(
-                f"{BD_BASE}/scrape",
-                params={"dataset_id": dataset, "format": "json", "include_errors": "true"},
-                headers=headers, json={"input": [{"url": url}]}, timeout=90,
-            )
-            if resp.status_code in (401, 403):
-                return {"status": "auth"}
-            if resp.status_code == 429:
-                return {"status": "ratelimit"}
-            if resp.status_code not in (200, 202):
-                return {"status": "error", "message": f"HTTP {resp.status_code}"}
-            bd_update(lambda s: s["usage"].__setitem__(today, s["usage"].get(today, 0) + 1))
-            body = _json_body(resp)
-            if resp.status_code == 202:
-                snapshot = body.get("snapshot_id") if isinstance(body, dict) else None
-                if not snapshot:
-                    return {"status": "error", "message": "snapshot tidak diterima"}
-                bd_update(lambda s: s["entries"].__setitem__(ck, {"at": time.time(), "status": "pending", "snapshot_id": snapshot}))
-            else:
-                payload = body
-
-        if payload is None:
-            deadline = time.time() + BD_WAIT_SECONDS
-            while time.time() < deadline:
-                prog = requests.get(f"{BD_BASE}/progress/{snapshot}", headers=headers, timeout=30)
-                status = prog.json().get("status") if prog.ok else None
-                if status == "ready":
-                    snap = requests.get(f"{BD_BASE}/snapshot/{snapshot}", params={"format": "json"}, headers=headers, timeout=60)
-                    if snap.status_code == 200:
-                        payload = _json_body(snap)
-                        break
-                elif status == "failed":
-                    bd_update(lambda s: s["entries"].pop(ck, None))
-                    return {"status": "error", "message": "Bright Data gagal memproses"}
-                time.sleep(4)
-            if payload is None:
-                return {"status": "pending"}
-
-        followers = _parse_followers(payload)
-        entry = {"at": time.time(), "status": "ok" if followers is not None else "missing"}
-        if followers is not None:
-            entry["followers"] = followers
-        bd_update(lambda s: s["entries"].__setitem__(ck, entry))
-        return {"status": entry["status"]}
-    except requests.RequestException as exc:
-        return {"status": "error", "message": exc.__class__.__name__}
-    finally:
-        with state["lock"]:
-            state["inflight"].discard(ck)
-
-
-def fmt_ago(ts) -> str:
-    s = max(int(time.time() - ts), 0)
-    if s < 90:
-        return "baru saja"
-    if s < 3600:
-        return f"{s // 60} menit lalu"
-    if s < 86400:
-        return f"{s // 3600} jam lalu"
-    return f"{s // 86400} hari lalu"
-
-
-LIVE_PLATFORMS = [("ig", "Instagram", "ig_handle", "ig_followers"), ("tt", "TikTok", "tt_handle", "tt_followers")]
-
-
-def _live_block(r, store, plat, label, hcol, ocol):
-    handle = r[hcol]
-    st.markdown(f'<div class="field-label">{e(label)}</div>', unsafe_allow_html=True)
-    if not (has(handle) and HANDLE_RE[plat].match(handle)):
-        st.markdown('<span class="dim">Tidak ada akun valid</span>', unsafe_allow_html=True)
-        return
-    ck = f"{plat}:{handle.lower()}"
-    ent = store["entries"].get(ck)
-    uid = f"{plat}_{r['row_id']}"
-    clicked = force = False
-    if bd_pending(ent):
-        clicked = st.button("Cek hasil", key=f"live_{uid}", width="stretch")
-    elif bd_fresh(ent):
-        with st.popover("Ambil ulang", width="stretch"):
-            st.caption("Akan mengirim 1 permintaan baru ke Bright Data.")
-            if st.button("Ya, ambil ulang", key=f"live_force_{uid}", type="primary"):
-                clicked = force = True
-    else:
-        clicked = st.button(f"Ambil follower {label}", key=f"live_{uid}", width="stretch")
-
-    if clicked:
-        with st.spinner(f"Mengambil data {label}…"):
-            res = bd_fetch(plat, handle, force=force)
-        msg = f"Gagal menghubungi Bright Data ({res.get('message', '')})." if res["status"] == "error" \
-            else BD_MESSAGES.get(res["status"])
-        if msg:
-            st.markdown(f'<div class="live-meta warn">{e(msg)}</div>', unsafe_allow_html=True)
-        ent = bd_load()["entries"].get(ck)
-
-    if ent and ent.get("status") == "ok":
-        new = int(ent["followers"])
-        old = 0 if pd.isna(r[ocol]) else int(r[ocol])
-        bits = ["pengikut", f"diambil {fmt_ago(ent['at'])}"]
-        if old > 0:
-            d = new - old
-            bits.append(f'<span class="{"up" if d >= 0 else "down"}">{"+" if d >= 0 else "-"}{fmt_int(abs(d))}</span> dari data pendaftaran')
-        st.markdown(f'<div class="live-num">{fmt_int(new)}</div><div class="live-meta">{" · ".join(bits)}</div>',
-                    unsafe_allow_html=True)
-    elif ent and ent.get("status") == "missing":
-        st.markdown(f'<div class="live-meta warn">Akun tidak ditemukan atau privat · diperiksa {fmt_ago(ent["at"])}</div>',
-                    unsafe_allow_html=True)
-
-
-def render_live(r):
-    if not bd_key():
-        st.caption("")
-        return
-    store = bd_load()
-    for spec in LIVE_PLATFORMS:
-        _live_block(r, store, *spec)
-    used = bd_load()["usage"].get(date.today().isoformat(), 0)
-    st.caption(
-        f"Satu klik = satu permintaan ke Bright Data. Hasil disimpan {int(bd_num('BRIGHTDATA_TTL_HOURS', 24))} jam, "
-        f"jadi membuka akun yang sama lagi tidak memakai kredit. Permintaan hari ini: {used} dari "
-        f"{int(bd_num('BRIGHTDATA_DAILY_LIMIT', 50))}."
-    )
-
-
 # ============================================================ DATA
 def _clean_handle(s: pd.Series) -> pd.Series:
     s = s.fillna("").astype(str).str.strip().str.split("?").str[0]
@@ -734,12 +483,6 @@ N = len(df)
 AGE_MIN, AGE_MAX = int(df["age"].min()), int(df["age"].max())
 DATE_MIN, DATE_MAX = df["registered_at"].min().date(), df["registered_at"].max().date()
 PERIOD_ORDER = list(dict.fromkeys(df["period"]))
-
-if (st.get_option("theme.primaryColor") or "").lower() != BLUE.lower():
-    st.warning(
-        "Tema biru belum aktif. Pastikan folder `.streamlit` (berisi `config.toml`) ada di samping "
-        "`app.py`, lalu jalankan ulang aplikasi."
-    )
 
 # ============================================================ DEFINISI FILTER
 # key -> (kolom, label, urutan opsi tetap atau None untuk "paling sering dulu")
@@ -1482,9 +1225,19 @@ def export_control():
 
 
 # ============================================================ KOMPONEN HALAMAN
+@functools.lru_cache(maxsize=1)
+def _logo_b64() -> str:
+    try:
+        return base64.b64encode(LOGO_PATH.read_bytes()).decode()
+    except OSError:  # logo belum ada: judul tampil tanpa logo
+        return ""
+
+
 def page_head(title: str, sub: str):
-    st.markdown(f'<div class="page-title">{e(title)}</div><div class="subtle">{e(sub)}</div>',
-                unsafe_allow_html=True)
+    b64 = _logo_b64()
+    logo = f'<img class="page-logo" src="data:image/jpeg;base64,{b64}" alt="Logo SPN">' if b64 else ""
+    st.markdown(f'<div class="page-head">{logo}<div><div class="page-title">{e(title)}</div>'
+                f'<div class="subtle">{e(sub)}</div></div></div>', unsafe_allow_html=True)
 
 
 def status_row(export: bool = False):
@@ -1622,9 +1375,6 @@ def render_record(r):
         social("TikTok", r["tt_handle"], r["tt_url"], r["tt_followers"], r["tier_tt"]),
         "</div>",
     ]), unsafe_allow_html=True)
-    with safe_section("Follower terbaru tidak dapat ditampilkan"):
-        render_live(r)
-
     parts = [
         '<div><div class="sec">Profil</div>',
         row("Kota", r["city"]), row("Usia", age), row("Status", r["marital"]),
@@ -1652,16 +1402,16 @@ def render_record(r):
 # ============================================================ GRAFIK: pembantu
 # Setiap grafik memakai satu warna aksen dari palet ini (bukan satu biru untuk semuanya),
 # dan batang diberi gradasi menurut nilai atau urutan supaya tetap sederhana tapi tidak monoton.
-BG = "#0A171E"
-TXT = "#E4F0F5"
-PANEL = "#0F2029"
+BG = "#FFFFFF"
+TXT = "#1A1464"
+PANEL = "#F6F8FE"
 A = {
-    "blue": "#2596BE", "teal": "#2DB5A5", "amber": "#8AD9C9", "violet": "#5E86D9",
-    "rose": "#2E6FD0", "green": "#9BB7E6", "sky": "#7AD3EE",
+    "blue": "#4A7CD9", "teal": "#2BA89A", "amber": "#F2A33A", "violet": "#7B5CD6",
+    "rose": "#E0457F", "green": "#3FA66B", "sky": "#4FA3E0",
 }
 CAT_PALETTE = [A["blue"], A["sky"], A["violet"], A["teal"], A["rose"], A["amber"], A["green"]]
 PAL2 = [A["blue"], A["sky"]]
-HEAT = ["#132B36", "#1D5C7A", "#2596BE", "#8FDDF2"]
+HEAT = ["#EAF0FC", "#B4C8F0", "#4A7CD9", "#1A1464"]
 AGE_BINS = ["<20", "20-24", "25-29", "30-34", "35-39", "40-44", "45-49", "\u226550"]
 PRESENCE_ORDER = ["Keduanya", "Hanya Instagram", "Hanya TikTok", "Tidak ada"]
 LOG_TICKS = [10, 100, 1000, 10000, 100000, 1000000, 10000000]
@@ -1884,7 +1634,7 @@ def heatmap(long, *, x, y, val, x_sort, y_sort, x_title, y_title, step=34):
         color=alt.Color(f"{val}:Q", scale=alt.Scale(range=HEAT), legend=None), tooltip=tips)
     txt = base.mark_text(fontSize=11).encode(
         text="_t:N", tooltip=tips,
-        color=alt.condition(f"datum['{val}'] > {mx * 0.45}", alt.value("#FFFFFF"), alt.value("#A9C6D4")))
+        color=alt.condition(f"datum['{val}'] > {mx * 0.45}", alt.value("#FFFFFF"), alt.value("#1A1464")))
     return (rect + txt).properties(height=alt.Step(step)).configure_view(stroke=None)
 
 
@@ -1964,7 +1714,7 @@ def _scatter_groups(d: pd.DataFrame, color_col, color_order):
         cats = cats + ["Lainnya"]
     pal = [CAT_PALETTE[i % len(CAT_PALETTE)] for i in range(len(cats))]
     if "Lainnya" in cats:
-        pal[-1] = "#6B8A99"
+        pal[-1] = "#69759F"
     return d, cats, pal
 
 
@@ -2003,16 +1753,16 @@ def chart_scatter(frame, color_col, color_order, color_label):
 def _plotly_base(**extra) -> dict:
     return dict(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color="#E4F0F5", size=12),
+        font=dict(color="#1A1464", size=12),
         margin=dict(l=0, r=0, t=36, b=0),
-        hoverlabel=dict(bgcolor="#132B36", font_color="#E4F0F5", bordercolor="#29536A"),
+        hoverlabel=dict(bgcolor="#FFFFFF", font_color="#1A1464", bordercolor="#BFCCEC"),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
         **extra,
     )
 
 
 def _log_axis(title: str) -> dict:
-    return dict(type="log", title=title, tickvals=LOG_TICKS, ticktext=LOG_TEXT, gridcolor="#1C3A47",
+    return dict(type="log", title=title, tickvals=LOG_TICKS, ticktext=LOG_TEXT, gridcolor="#DCE4F5",
                 zeroline=False, showline=False)
 
 
@@ -2033,21 +1783,21 @@ def chart_trend_plotly(frame):
     fig.update_layout(**_plotly_base(showlegend=False, hovermode="x unified"))
     fig.update_xaxes(
         showgrid=False, tickformat="%b %Y",
-        rangeslider=dict(visible=True, thickness=0.09, bgcolor="#0F2029", bordercolor="#1C3A47", borderwidth=1),
+        rangeslider=dict(visible=True, thickness=0.09, bgcolor="#F6F8FE", bordercolor="#DCE4F5", borderwidth=1),
         rangeselector=dict(
-            bgcolor="#132B36", activecolor=BLUE, font=dict(color="#E4F0F5"), bordercolor="#29536A", borderwidth=1,
+            bgcolor="#FFFFFF", activecolor=BLUE, font=dict(color="#1A1464"), bordercolor="#BFCCEC", borderwidth=1,
             buttons=[dict(count=6, label="6 bln", step="month", stepmode="backward"),
                      dict(count=1, label="1 thn", step="year", stepmode="backward"),
                      dict(step="all", label="Semua")],
         ),
     )
-    fig.update_yaxes(gridcolor="#1C3A47", zeroline=False, rangemode="tozero")
+    fig.update_yaxes(gridcolor="#DCE4F5", zeroline=False, rangemode="tozero")
     return fig
 
 
 # ---- scatter pengikut IG vs TikTok (Plotly)
-EXT_HI = "#4ADE80"   # hijau: pengikut tertinggi
-EXT_LO = "#FF7A90"   # merah muda: pengikut terendah
+EXT_HI = "#1E8A4F"   # hijau: pengikut tertinggi
+EXT_LO = "#D6336C"   # merah muda: pengikut terendah
 BRAND_FONT = "SPNBrands, sans-serif"  # font logo (didefinisikan di CSS)
 
 
@@ -2130,7 +1880,7 @@ def chart_scatter_plotly(frame, color_col, color_order, color_label, three_d=Fal
 
     med_ig, med_tt = float(d["ig_followers"].median()), float(d["tt_followers"].median())
     if three_d:
-        axis3d = dict(showbackground=False, gridcolor="#1C3A47", zeroline=False)
+        axis3d = dict(showbackground=False, gridcolor="#DCE4F5", zeroline=False)
         fig.update_layout(**_plotly_base(scene=dict(
             xaxis={**_log_axis("Pengikut Instagram"), **axis3d},
             yaxis={**_log_axis("Pengikut TikTok"), **axis3d},
@@ -2144,8 +1894,8 @@ def chart_scatter_plotly(frame, color_col, color_order, color_label, three_d=Fal
         for kw, txt in ((dict(x=med_ig), f"median IG {fmt_compact(med_ig)}"),
                         (dict(y=med_tt), f"median TikTok {fmt_compact(med_tt)}")):
             (fig.add_vline if "x" in kw else fig.add_hline)(
-                line=dict(color="#6B8A99", width=1, dash="dot"), annotation_text=txt,
-                annotation_font=dict(size=10, color="#8FAAB8"), **kw)
+                line=dict(color="#69759F", width=1, dash="dot"), annotation_text=txt,
+                annotation_font=dict(size=10, color="#55608A"), **kw)
     return fig, len(rest) + len(ext_idx), total
 
 
@@ -2496,7 +2246,7 @@ def page_reach():
             presence = pd.Series(np.select([ig_has & tt_has, ig_has, tt_has], PRESENCE_ORDER[:3], PRESENCE_ORDER[3]),
                                  index=view.index)
             show(chart_donut(presence, label="Akun", order=PRESENCE_ORDER,
-                             colors=[A["teal"], A["rose"], A["sky"], "#6B8A99"]))
+                             colors=[A["teal"], A["rose"], A["sky"], "#69759F"]))
     with e2:
         with card("Tier Instagram dan tier TikTok", note="Angka di dalam kotak adalah jumlah data."):
             show(chart_cross(view, "tier_tt", "tier_ig", x_order=TIER_ORDER, y_order=TIER_ORDER,
@@ -2546,7 +2296,7 @@ def page_economy():
     with e2:
         with card("Punya usaha"):
             show(chart_donut(view["business"], label="Usaha", order=["Punya usaha", "Tanpa usaha"],
-                             colors=[A["green"], "#6B8A99"]))
+                             colors=[A["green"], "#69759F"]))
 
     with card("Jenis HP"):
         show(chart_donut(view["phone_type"], label="Jenis HP", colors=[A["teal"], A["violet"]]))
