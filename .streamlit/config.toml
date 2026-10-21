@@ -1,20 +1,20 @@
-# Tema SPN Data Explorer: biru-teal gelap dengan aksen #2596BE.
+# Tema SPN Data Explorer: biru royal khas website SPN, tombol pink, teks navy.
 # Letakkan folder .streamlit ini di samping app.py.
 
 [theme]
-base = "dark"
-primaryColor = "#2596BE"
-backgroundColor = "#0A171E"
-secondaryBackgroundColor = "#0F2029"
-textColor = "#E4F0F5"
-linkColor = "#6CC8E6"
-borderColor = "#1C3A47"
+base = "light"
+primaryColor = "#2F5FC0"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F1F5FD"
+textColor = "#1A1464"
+linkColor = "#2F5FC0"
+borderColor = "#DCE4F5"
 showWidgetBorder = true
-baseRadius = "0.4rem"
-buttonRadius = "0.4rem"
-dataframeBorderColor = "#1C3A47"
-dataframeHeaderBackgroundColor = "#132B36"
+baseRadius = "1rem"
+buttonRadius = "full"
+dataframeBorderColor = "#DCE4F5"
+dataframeHeaderBackgroundColor = "#EAF0FC"
 
 [theme.sidebar]
-backgroundColor = "#0C1E27"
-secondaryBackgroundColor = "#08141A"
+backgroundColor = "#F6F8FE"
+secondaryBackgroundColor = "#EAF0FC"
