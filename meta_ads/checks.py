@@ -27,7 +27,7 @@ def _close(a: float, b: float, tol=0.01) -> bool:
     return abs(a - b) <= max(tol * max(abs(a), abs(b)), 1.0)
 
 
-def run_health_checks(client, account_id, since, until, business_id=None):
+def run_health_checks(client, account_id, since, until, business_id=None, *, include_business_pages=True):
     out: list[Check] = []
     ctx: dict = {}
 
@@ -171,6 +171,10 @@ def run_health_checks(client, account_id, since, until, business_id=None):
                         + ("" if ok else " (campaign yang sudah dihapus bisa tidak ikut ter-list)"))
             except MetaAPIError as e:
                 add("Rekonsiliasi", "Total campaign = total akun", "warn", msg(e))
+
+    # Dashboard iklan Instagram tidak memerlukan data Business Portfolio / Facebook Pages.
+    if not include_business_pages:
+        return out, ctx
 
     # ---- 4. Business & Pages (opsional) ----
     if not biz_id:

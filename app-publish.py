@@ -149,7 +149,16 @@ CSS = """
 [data-testid="stAppDeployButton"] { display: none; }
 [data-testid="stHeader"] { background: var(--blue); border-bottom: 0; }
 [data-testid="stHeader"], [data-testid="stHeader"] * { color: #fff; }
-[data-testid="stHeader"] a, [data-testid="stHeader"] button { border-radius: 999px; font-weight: 600; }
+[data-testid="stHeader"] a, [data-testid="stHeader"] button {
+  border-radius: 999px; font-weight: 600; white-space: nowrap;
+}
+/* Navigasi desktop lebih rapat agar seluruh menu utama muat tanpa masuk ke "1 more". */
+[data-testid="stHeader"] nav { gap: 0.2rem !important; }
+[data-testid="stHeader"] nav a {
+  padding: 0.32rem 0.58rem !important; font-size: 0.88rem !important; gap: 0.32rem !important;
+}
+[data-testid="stHeader"] nav button { padding: 0.32rem 0.5rem !important; }
+[data-testid="stHeader"] [data-testid*="Navigation"] { gap: 0.2rem !important; }
 /* logo di samping judul halaman */
 .page-head { display: flex; align-items: center; gap: 1rem; }
 .page-logo { height: 3.2rem; width: auto; border-radius: 12px; display: block; flex: none; }
@@ -2352,7 +2361,7 @@ except Exception as _exc:
 
 
 def page_meta_ads():
-    page_head("Meta Ads", "Performa iklan Traffic dan Leads, cek alur data, dan administrasi akun")
+    page_head("Meta Ads", "Ringkasan performa iklan Instagram, Traffic, dan Leads.")
     if _render_meta_ads is None:
         st.error(f"Modul Meta Ads tidak dapat dimuat: {_META_ADS_ERR}")
         return
@@ -2365,8 +2374,10 @@ PAGES = [
     st.Page(page_data, title="Data", icon=":material/table_view:", default=True),
     st.Page(page_overview, title="Ringkasan", icon=":material/dashboard:", url_path="ringkasan"),
     st.Page(page_audience, title="Audiens", icon=":material/groups:", url_path="audiens"),
-    st.Page(page_reach, title="Jangkauan sosmed", icon=":material/campaign:", url_path="jangkauan"),
-    st.Page(page_economy, title="Ekonomi dan profil", icon=":material/payments:", url_path="ekonomi"),
+    # Label navigasi dibuat singkat agar seluruh menu muat pada desktop.
+    # Judul halaman di dalam konten tetap memakai nama lengkap.
+    st.Page(page_reach, title="Jangkauan", icon=":material/campaign:", url_path="jangkauan"),
+    st.Page(page_economy, title="Ekonomi", icon=":material/payments:", url_path="ekonomi"),
     st.Page(page_meta_ads, title="Meta Ads", icon=":material/ads_click:", url_path="meta-ads"),
 ]
 # Menu halaman di bagian atas halaman utama (bukan di sidebar); sidebar khusus untuk pencarian dan filter.
