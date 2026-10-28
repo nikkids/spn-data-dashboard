@@ -2342,6 +2342,24 @@ def page_economy():
         show(chart_donut(view["phone_type"], label="Jenis HP", colors=[A["teal"], A["violet"]]))
 
 
+# ============================================================ META ADS (halaman tambahan)
+# Kode ada di folder meta_ads/. Kalau modulnya bermasalah, hanya halaman ini yang menampilkan pesan error.
+try:
+    from meta_ads.page import render as _render_meta_ads
+    _META_ADS_ERR = None
+except Exception as _exc:
+    _render_meta_ads, _META_ADS_ERR = None, _exc
+
+
+def page_meta_ads():
+    page_head("Meta Ads", "Performa iklan Traffic dan Leads, cek alur data, dan administrasi akun")
+    if _render_meta_ads is None:
+        st.error(f"Modul Meta Ads tidak dapat dimuat: {_META_ADS_ERR}")
+        return
+    with safe_section("Halaman Meta Ads tidak dapat ditampilkan"):
+        _render_meta_ads()
+
+
 # ============================================================ NAVIGASI
 PAGES = [
     st.Page(page_data, title="Data", icon=":material/table_view:", default=True),
@@ -2349,12 +2367,13 @@ PAGES = [
     st.Page(page_audience, title="Audiens", icon=":material/groups:", url_path="audiens"),
     st.Page(page_reach, title="Jangkauan sosmed", icon=":material/campaign:", url_path="jangkauan"),
     st.Page(page_economy, title="Ekonomi dan profil", icon=":material/payments:", url_path="ekonomi"),
+    st.Page(page_meta_ads, title="Meta Ads", icon=":material/ads_click:", url_path="meta-ads"),
 ]
 # Menu halaman di bagian atas halaman utama (bukan di sidebar); sidebar khusus untuk pencarian dan filter.
 pg = st.navigation(PAGES, position="top")
 
 # ---- tampilan kosong: tunjukkan filter mana yang bisa dilonggarkan (berlaku di semua halaman)
-if n_match == 0:
+if n_match == 0 and pg.url_path != "meta-ads":  # halaman Meta Ads tidak memakai filter influencer
     status_row()
     st.warning("Tidak ada data yang cocok dengan kombinasi ini.")
     rescue = sorted(((int(others(g).sum()), g) for g in ACTIVE), reverse=True)
