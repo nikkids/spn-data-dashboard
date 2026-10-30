@@ -1640,7 +1640,7 @@ def _pdf_report(payload) -> bytes:
         canvas.line(13*mm, 11*mm, w - 13*mm, 11*mm)
         canvas.setFillColor(muted)
         canvas.setFont("Helvetica", 7)
-        canvas.drawString(13*mm, 6.5*mm, "SPN DATA EXPLORER  |  INTERNAL & CONFIDENTIAL")
+        canvas.drawString(13*mm, 6.5*mm, "SPN DATA EXPLORER ")
         canvas.drawRightString(w - 13*mm, 6.5*mm, f"PAGE {doc_.page}")
         canvas.restoreState()
 
