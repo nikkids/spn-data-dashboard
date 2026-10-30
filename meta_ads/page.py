@@ -716,6 +716,69 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
                 )
 
 
+
+def render_data_check(ctx: Ctx):
+    """Pemeriksaan token, akses akun iklan, dan integritas Insights Instagram Ads."""
+    start, end = ctx.start, ctx.end
+    st.markdown('<div class="section-title">Status koneksi dan kualitas data</div>', unsafe_allow_html=True)
+    st.caption("Memeriksa access token, akses akun iklan, dan konsistensi data Insights Instagram Ads.")
+    health_key = (start, end, ctx.account)
+    should_run = (
+        st.button("Periksa ulang", key="mx_run_health_check_v3")
+        or st.session_state.get("mx_health_key_v3") != health_key
+    )
+    if should_run:
+        with st.spinner("Memeriksa koneksi dan data iklan..."):
+            checks, health_ctx = run_health_checks(
+                ctx.client, ctx.account, start, end, None, include_business_pages=False
+            )
+        st.session_state.mx_health_v3 = {
+            "checks": checks, "ctx": health_ctx, "rng": (start, end), "at": datetime.now()
+        }
+        st.session_state.mx_health_key_v3 = health_key
+
+    health = st.session_state.get(
+        "mx_health_v3",
+        {"checks": [], "ctx": {}, "rng": (start, end), "at": datetime.now()},
+    )
+    counts = Counter(check.status for check in health["checks"])
+    if counts["fail"]:
+        st.error(f"Ada {counts['fail']} hal yang perlu diperiksa.")
+    elif counts["warn"]:
+        st.warning(f"Ada {counts['warn']} peringatan untuk ditinjau.")
+    elif health["checks"]:
+        st.success("Pemeriksaan selesai. Tidak ada kegagalan yang terdeteksi.")
+    else:
+        st.info("Belum ada hasil pemeriksaan. Klik Periksa ulang untuk memulai.")
+
+    headline_cards([
+        ("Lolos", idn(counts["pass"]), "Pengecekan berhasil", "#2D9C9A"),
+        ("Peringatan", idn(counts["warn"]), "Perlu ditinjau", "#E2A13A"),
+        ("Gagal", idn(counts["fail"]), "Perlu tindakan", "#D91A7D"),
+        ("Info", idn(counts["info"]), "Informasi tambahan", "#4A7CD9"),
+    ])
+    st.caption(f"Terakhir diperiksa {health['at']:%H:%M:%S} · {health['rng'][0]} – {health['rng'][1]}")
+    with st.expander("Detail pemeriksaan", expanded=False):
+        checks_df = pd.DataFrame([{
+            "Status": check.status.upper(), "Bagian": check.group,
+            "Pemeriksaan": check.name, "Keterangan": check.detail,
+        } for check in health["checks"]])
+        if checks_df.empty:
+            st.info("Belum ada hasil pemeriksaan.")
+        else:
+            st.dataframe(checks_df, hide_index=True, width="stretch")
+
+    daily = health["ctx"].get("daily")
+    if daily is not None and not daily.empty:
+        with st.expander("Total data dari akun iklan", expanded=False):
+            cols = st.columns(3)
+            cols[0].metric("Belanja", money(daily["spend"].sum()))
+            cols[1].metric("Impresi", idn(daily["impressions"].sum()))
+            cols[2].metric("Klik", idn(daily["clicks"].sum()))
+            st.dataframe(daily.sort_values("date_start", ascending=False).head(15),
+                         hide_index=True, width="stretch")
+
+
 def render_admin(ctx: Ctx):
     """Info akun iklan dan log API; tidak meminta atau menampilkan data Facebook Pages."""
     with st.container(border=True):
@@ -913,337 +976,676 @@ def _report_payload(ctx: Ctx, raw_campaigns):
 
 
 def _excel_report(payload) -> bytes:
-    """Workbook terformat: executive summary, funnel, campaign detail, dan tren harian."""
-    import xlsxwriter  # noqa: F401 - memastikan engine tersedia di deployment
+    """Workbook profesional dengan dashboard eksekutif, funnel, campaign, dan daily trend."""
+    import xlsxwriter  # noqa: F401 - runtime dependency used by pandas ExcelWriter
 
     output = BytesIO()
+    metrics = payload["metrics"]
+    funnel = payload["funnel"]
+    objective = payload["objective"]
+    campaigns = payload["campaigns"]
+    daily = payload["daily"]
+
+    def metric_value(metric_name, column="Total / Global"):
+        found = metrics.loc[metrics["Metrik"] == metric_name]
+        if found.empty or column not in found:
+            return None
+        value = found.iloc[0][column]
+        return None if value is None or pd.isna(value) else float(value)
+
+    def funnel_value(part):
+        found = funnel.loc[funnel["Metrik"].astype(str).str.startswith(part)]
+        if found.empty:
+            return None
+        value = found.iloc[0]["Nilai"]
+        return None if value is None or pd.isna(value) else float(value)
+
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd mmm yyyy") as writer:
-        payload["metrics"].to_excel(writer, sheet_name="KPI Summary", index=False, startrow=4)
-        payload["objective"].to_excel(writer, sheet_name="KPI Summary", index=False, startrow=17)
-        payload["funnel"].to_excel(writer, sheet_name="Community Funnel", index=False, startrow=4)
-        payload["campaigns"].to_excel(writer, sheet_name="Campaign Detail", index=False, startrow=4)
-        payload["daily"].to_excel(writer, sheet_name="Daily Trend", index=False, startrow=4)
+        # Reserve report sheets and place structured data under designed title areas.
+        objective.to_excel(writer, sheet_name="Executive Summary", index=False, startrow=15)
+        funnel.to_excel(writer, sheet_name="Community Funnel", index=False, startrow=10)
+        campaigns.to_excel(writer, sheet_name="Campaign Detail", index=False, startrow=4)
+        daily.to_excel(writer, sheet_name="Daily Trend", index=False, startrow=4)
 
         workbook = writer.book
-        navy = "1A1464"
+        navy = "172554"
         blue = "497CD6"
-        pale = "EAF1FF"
-        muted = "65718F"
-        title_fmt = workbook.add_format({"bold": True, "font_size": 18, "font_color": navy})
-        subtitle_fmt = workbook.add_format({"font_size": 10, "font_color": muted})
-        section_fmt = workbook.add_format({"bold": True, "font_size": 11, "font_color": navy, "bottom": 2, "bottom_color": blue})
-        header_fmt = workbook.add_format({"bold": True, "font_color": "FFFFFF", "bg_color": navy, "text_wrap": True, "valign": "vcenter", "border": 0})
-        money_fmt = workbook.add_format({"num_format": '"Rp" #,##0;[Red]("Rp" #,##0);-'})
-        number_fmt = workbook.add_format({"num_format": "#,##0;[Red](#,##0);-"})
-        percent_fmt = workbook.add_format({"num_format": '0.00"%"'})
-        date_fmt = workbook.add_format({"num_format": "dd mmm yyyy"})
-        text_fmt = workbook.add_format({"font_color": "24304F"})
-        note_fmt = workbook.add_format({"font_color": muted, "italic": True, "text_wrap": True, "valign": "top"})
-        sheet_widths = {
-            "KPI Summary": 9,
-            "Community Funnel": max(2, len(payload["funnel"].columns)),
-            "Campaign Detail": max(1, len(payload["campaigns"].columns)),
-            "Daily Trend": max(1, len(payload["daily"].columns)),
-        }
-        for name in writer.sheets:
-            ws = writer.sheets[name]
-            last_col = sheet_widths.get(name, 4) - 1
+        blue_light = "EAF1FF"
+        teal = "168C88"
+        teal_light = "E7F5F3"
+        gold = "C58A25"
+        gold_light = "FFF5DF"
+        magenta = "C0266D"
+        magenta_light = "FCEAF2"
+        ink = "24304F"
+        muted = "68758F"
+        white = "FFFFFF"
+        border = "DCE4F0"
+        soft = "F5F7FB"
+
+        title_fmt = workbook.add_format({"bold": True, "font_size": 19, "font_color": white,
+                                         "bg_color": navy, "valign": "vcenter", "align": "left"})
+        subtitle_fmt = workbook.add_format({"font_size": 10, "font_color": "D7E2F6",
+                                            "bg_color": navy, "valign": "vcenter"})
+        section_fmt = workbook.add_format({"bold": True, "font_size": 11, "font_color": navy,
+                                           "bg_color": blue_light, "bottom": 1, "bottom_color": blue,
+                                           "valign": "vcenter"})
+        header_fmt = workbook.add_format({"bold": True, "font_color": white, "bg_color": navy,
+                                          "text_wrap": True, "valign": "vcenter", "align": "left",
+                                          "bottom": 1, "bottom_color": navy})
+        body_fmt = workbook.add_format({"font_color": ink, "valign": "vcenter"})
+        body_alt_fmt = workbook.add_format({"font_color": ink, "bg_color": soft, "valign": "vcenter"})
+        money_fmt = workbook.add_format({"font_color": ink, "num_format": '"Rp" #,##0;[Red]("Rp" #,##0);-'})
+        number_fmt = workbook.add_format({"font_color": ink, "num_format": "#,##0;[Red](#,##0);-"})
+        percent_fmt = workbook.add_format({"font_color": ink, "num_format": '0.00"%"'})
+        date_fmt = workbook.add_format({"font_color": ink, "num_format": "dd mmm yyyy"})
+        note_fmt = workbook.add_format({"font_color": muted, "italic": True, "text_wrap": True,
+                                        "valign": "top", "font_size": 9})
+        tile_label_formats = [
+            workbook.add_format({"bold": True, "font_color": muted, "bg_color": blue_light,
+                                 "align": "center", "valign": "vcenter", "bottom": 0}),
+            workbook.add_format({"bold": True, "font_color": muted, "bg_color": teal_light,
+                                 "align": "center", "valign": "vcenter", "bottom": 0}),
+            workbook.add_format({"bold": True, "font_color": muted, "bg_color": gold_light,
+                                 "align": "center", "valign": "vcenter", "bottom": 0}),
+            workbook.add_format({"bold": True, "font_color": muted, "bg_color": magenta_light,
+                                 "align": "center", "valign": "vcenter", "bottom": 0}),
+        ]
+        tile_value_formats = [
+            workbook.add_format({"bold": True, "font_size": 18, "font_color": navy, "bg_color": blue_light,
+                                 "align": "center", "valign": "vcenter", "num_format": '"Rp" #,##0'}),
+            workbook.add_format({"bold": True, "font_size": 18, "font_color": teal, "bg_color": teal_light,
+                                 "align": "center", "valign": "vcenter", "num_format": "#,##0"}),
+            workbook.add_format({"bold": True, "font_size": 18, "font_color": gold, "bg_color": gold_light,
+                                 "align": "center", "valign": "vcenter", "num_format": "#,##0"}),
+            workbook.add_format({"bold": True, "font_size": 18, "font_color": magenta, "bg_color": magenta_light,
+                                 "align": "center", "valign": "vcenter", "num_format": '0.00"%"'}),
+        ]
+        tile_money_fmt = workbook.add_format({"bold": True, "font_size": 18, "font_color": navy,
+                                              "bg_color": blue_light, "align": "center", "valign": "vcenter",
+                                              "num_format": '"Rp" #,##0'})
+        tile_number_fmt = workbook.add_format({"bold": True, "font_size": 18, "font_color": navy,
+                                               "bg_color": blue_light, "align": "center", "valign": "vcenter",
+                                               "num_format": "#,##0"})
+        tile_percent_fmt = workbook.add_format({"bold": True, "font_size": 18, "font_color": navy,
+                                                "bg_color": blue_light, "align": "center", "valign": "vcenter",
+                                                "num_format": '0.00"%"'})
+
+        period = f"{payload['start']:%d %b %Y} - {payload['end']:%d %b %Y}"
+
+        def banner(ws, last_col, title, subtitle=None):
             ws.hide_gridlines(2)
-            ws.set_default_row(20)
+            ws.set_default_row(21)
             ws.set_tab_color(blue)
             ws.set_landscape()
             ws.fit_to_pages(1, 0)
-            ws.set_margins(0.25, 0.25, 0.5, 0.5)
-            ws.freeze_panes(5 if name in ("Campaign Detail", "Daily Trend") else 4, 0)
-            ws.merge_range(0, 0, 0, last_col, "SPN | INSTAGRAM ADS PERFORMANCE REPORT", title_fmt)
-            ws.merge_range(1, 0, 1, min(last_col, 3), f"Periode: {payload['start']:%d %b %Y} – {payload['end']:%d %b %Y}", subtitle_fmt)
-            ws.set_row(0, 30)
-            ws.set_row(2, 22)
-        # KPI Summary: table utama dan per objective.
-        ws = writer.sheets["KPI Summary"]
-        ws.merge_range("A3:D3", "RINGKASAN KPI", section_fmt)
-        for col_idx, col_name in enumerate(payload["metrics"].columns):
-            ws.write(4, col_idx, col_name, header_fmt)
-        ws.set_row(4, 32)
-        ws.set_row(15, 22)
-        ws.set_row(16, 8)
-        ws.set_column("A:A", 32, text_fmt)
-        ws.set_column("B:D", 20, number_fmt)
-        ws.set_column("E:I", 20, number_fmt)
-        for row in (4,):
-            for col in (1, 2, 3):
-                ws.set_column(col, col, 20, number_fmt)
-        ws.merge_range("A16:I16", "PERFORMA PER OBJECTIVE", section_fmt)
-        for col_idx, col_name in enumerate(payload["objective"].columns):
-            ws.write(17, col_idx, col_name, header_fmt)
-        ws.set_row(17, 32)
-        # Format sel tabel objective per baris agar format kolom Leads di KPI utama
-        # tidak ikut berubah menjadi format mata uang.
+            ws.set_margins(0.28, 0.28, 0.45, 0.45)
+            ws.merge_range(0, 0, 1, last_col, title, title_fmt)
+            ws.merge_range(2, 0, 2, last_col, subtitle or f"Instagram Ads Performance | Reporting period: {period}", subtitle_fmt)
+            ws.set_row(0, 25)
+            ws.set_row(1, 13)
+            ws.set_row(2, 24)
+            ws.set_header("&LSPN | INTERNAL&CRun date: &D")
+            ws.set_footer("&LConfidential - Internal Use Only&CSPN Performance Report&RPage &P of &N")
+
+        def tile(ws, row, col, label, value, value_format, palette_index=0, width=3):
+            end_col = col + width - 1
+            ws.merge_range(row, col, row, end_col, label.upper(), tile_label_formats[palette_index % 4])
+            ws.merge_range(row + 1, col, row + 2, end_col, value if value is None else value,
+                           value_format if value is not None else tile_value_formats[palette_index % 4])
+
+        # EXECUTIVE SUMMARY
+        ws = writer.sheets["Executive Summary"]
+        banner(ws, 11, "SPN | INSTAGRAM ADS PERFORMANCE", f"EXECUTIVE SUMMARY     •     {period}")
+        ws.set_column(0, 11, 13.2)
+        ws.merge_range("A4:L4", "PERFORMANCE SNAPSHOT", section_fmt)
+        tiles = [
+            ("Total Ad Spend", metric_value("Total Spend (Rp)"), tile_money_fmt, 0),
+            ("Profile Visits", metric_value("Result", "Traffic"), tile_number_fmt, 1),
+            ("Community Joins", funnel_value("Total Join Community"), tile_number_fmt, 2),
+            ("Conversion Rate", funnel_value("CR"), tile_percent_fmt, 3),
+            ("Customer Acquisition Cost", funnel_value("CAC"), tile_money_fmt, 0),
+            ("Followers From Ads", metric_value("Follower By Ads"), tile_number_fmt, 1),
+            ("Instagram Followers", metric_value("Follower Asli IG"), tile_number_fmt, 2),
+            ("Impressions", metric_value("Impressions"), tile_number_fmt, 3),
+        ]
+        for i, (label, value, fmt, palette_index) in enumerate(tiles):
+            row = 5 if i < 4 else 9
+            col = (i % 4) * 3
+            tile(ws, row, col, label, value, fmt, palette_index)
+        for r in (5, 9): ws.set_row(r, 21)
+        for r in (6, 7, 10, 11): ws.set_row(r, 22)
+        ws.merge_range("A14:I14", "OBJECTIVE PERFORMANCE", section_fmt)
+        obj_header_row = 15
+        for col_idx, col_name in enumerate(objective.columns):
+            ws.write(obj_header_row, col_idx, col_name, header_fmt)
+        ws.set_row(obj_header_row, 34)
         objective_money_fields = {"Spend (Rp)", "Cost per Result (Rp)", "CPF (Rp)"}
-        for row_idx, row_data in payload["objective"].iterrows():
-            for col_idx, col_name in enumerate(payload["objective"].columns):
+        for row_idx, (_, row_data) in enumerate(objective.iterrows(), start=obj_header_row + 1):
+            for col_idx, col_name in enumerate(objective.columns):
                 value = row_data[col_name]
-                if pd.notna(value) and isinstance(value, (int, float)):
-                    cell_fmt = money_fmt if col_name in objective_money_fields else number_fmt
-                    ws.write_number(18 + row_idx, col_idx, float(value), cell_fmt)
-        # Format kolom uang khusus pada KPI utama.
-        for row in [5, 7, 9]:
-            for col in [1, 2, 3]:
-                metric_idx = row - 5
-                if col < len(payload["metrics"].columns) and pd.notna(payload["metrics"].iloc[metric_idx, col]):
-                    ws.write_number(row, col, float(payload["metrics"].iloc[metric_idx, col]), money_fmt)
-        # Funnel
+                fmt = money_fmt if col_name in objective_money_fields else number_fmt
+                if value is None or pd.isna(value):
+                    ws.write_blank(row_idx, col_idx, None, body_alt_fmt if row_idx % 2 == 0 else body_fmt)
+                elif isinstance(value, (int, float)):
+                    ws.write_number(row_idx, col_idx, float(value), fmt)
+                else:
+                    ws.write(row_idx, col_idx, str(value), body_alt_fmt if row_idx % 2 == 0 else body_fmt)
+        obj_widths = {"Objective": 15, "Campaign": 12, "Spend (Rp)": 18, "Result": 15,
+                      "Cost per Result (Rp)": 21, "Follower By Ads": 18, "CPF (Rp)": 18,
+                      "Impressions": 17, "Reach": 17}
+        for col_idx, col_name in enumerate(objective.columns):
+            ws.set_column(col_idx, col_idx, obj_widths.get(col_name, 16))
+        ws.freeze_panes(16, 0)
+
+        # Visual trend panels on the first sheet make the executive page useful at a glance.
+        if len(daily):
+            daily_last_row = 4 + len(daily)
+            summary_spend_chart = workbook.add_chart({"type": "line"})
+            for col_idx, label, chart_color in ((1, "Traffic", blue), (2, "Leads", magenta)):
+                if col_idx < len(daily.columns):
+                    summary_spend_chart.add_series({
+                        "name": label,
+                        "categories": ["Daily Trend", 5, 0, daily_last_row, 0],
+                        "values": ["Daily Trend", 5, col_idx, daily_last_row, col_idx],
+                        "line": {"width": 2.25, "color": chart_color},
+                    })
+            summary_spend_chart.set_title({"name": "Daily Ad Spend", "name_font": {"size": 11, "bold": True, "color": navy}})
+            summary_spend_chart.set_legend({"position": "bottom"})
+            summary_spend_chart.set_x_axis({"date_axis": True, "num_format": "dd mmm", "label_position": "low"})
+            summary_spend_chart.set_y_axis({"num_format": '\"Rp\" #,##0', "major_gridlines": {"visible": True, "line": {"color": border}}})
+            summary_spend_chart.set_chartarea({"border": {"none": True}, "fill": {"color": white}})
+            summary_spend_chart.set_plotarea({"border": {"none": True}, "fill": {"color": white}})
+            summary_spend_chart.set_size({"width": 510, "height": 255})
+            ws.insert_chart("A20", summary_spend_chart)
+
+            if "Follower baru" in daily.columns and daily["Follower baru"].notna().any():
+                follower_col_summary = list(daily.columns).index("Follower baru")
+                summary_follower_chart = workbook.add_chart({"type": "line"})
+                summary_follower_chart.add_series({
+                    "name": "Follower baru",
+                    "categories": ["Daily Trend", 5, 0, daily_last_row, 0],
+                    "values": ["Daily Trend", 5, follower_col_summary, daily_last_row, follower_col_summary],
+                    "line": {"width": 2.5, "color": teal},
+                    "marker": {"type": "circle", "size": 4, "border": {"color": teal}, "fill": {"color": white}},
+                })
+                summary_follower_chart.set_title({"name": "Daily Follower Activity", "name_font": {"size": 11, "bold": True, "color": navy}})
+                summary_follower_chart.set_legend({"none": True})
+                summary_follower_chart.set_x_axis({"date_axis": True, "num_format": "dd mmm", "label_position": "low"})
+                summary_follower_chart.set_y_axis({"major_gridlines": {"visible": True, "line": {"color": border}}})
+                summary_follower_chart.set_chartarea({"border": {"none": True}, "fill": {"color": white}})
+                summary_follower_chart.set_plotarea({"border": {"none": True}, "fill": {"color": white}})
+                summary_follower_chart.set_size({"width": 510, "height": 255})
+                ws.insert_chart("G20", summary_follower_chart)
+
+        # COMMUNITY FUNNEL
         ws = writer.sheets["Community Funnel"]
-        ws.merge_range("A3:B3", "COMMUNITY CONVERSION", section_fmt)
-        for col_idx, col_name in enumerate(payload["funnel"].columns):
-            ws.write(4, col_idx, col_name, header_fmt)
-        ws.set_row(4, 32)
-        ws.set_column("A:A", 42, text_fmt)
-        ws.set_column("B:B", 24, number_fmt)
-        for idx, row in payload["funnel"].iterrows():
-            value = row["Nilai"]
-            if pd.notna(value):
-                fmt = money_fmt if "CAC" in row["Metrik"] else (percent_fmt if "CR" in row["Metrik"] else number_fmt)
-                ws.write_number(5 + idx, 1, float(value), fmt)
-        # Campaign detail
+        banner(ws, 7, "SPN | COMMUNITY CONVERSION", f"COMMUNITY FUNNEL     •     {period}")
+        ws.set_column("A:A", 39)
+        ws.set_column("B:B", 23)
+        ws.set_column("C:H", 13)
+        funnel_cards = [
+            ("Profile Visits", funnel_value("Profile Visits"), tile_number_fmt, 1),
+            ("Community Joins", funnel_value("Total Join Community"), tile_number_fmt, 2),
+            ("Conversion Rate", funnel_value("CR"), tile_percent_fmt, 3),
+            ("Acquisition Cost", funnel_value("CAC"), tile_money_fmt, 0),
+        ]
+        for i, (label, value, fmt, pidx) in enumerate(funnel_cards):
+            tile(ws, 4, i * 2, label, value, fmt, pidx, width=2)
+        ws.merge_range("A9:B9", "FUNNEL METRICS", section_fmt)
+        for col_idx, col_name in enumerate(funnel.columns):
+            ws.write(10, col_idx, col_name, header_fmt)
+        for row_idx, (_, row_data) in enumerate(funnel.iterrows(), start=11):
+            ws.write(row_idx, 0, str(row_data["Metrik"]), body_alt_fmt if row_idx % 2 else body_fmt)
+            value = row_data["Nilai"]
+            if value is None or pd.isna(value):
+                ws.write_blank(row_idx, 1, None, body_fmt)
+            else:
+                fmt = money_fmt if "CAC" in str(row_data["Metrik"]) else (percent_fmt if "CR" in str(row_data["Metrik"]) else number_fmt)
+                ws.write_number(row_idx, 1, float(value), fmt)
+        ws.set_row(10, 30)
+        ws.freeze_panes(11, 0)
+
+        # CAMPAIGN DETAIL
         ws = writer.sheets["Campaign Detail"]
-        ws.merge_range(
-            3, 0, 3, max(0, len(payload["campaigns"].columns) - 1),
-            "SELURUH CAMPAIGN DALAM PERIODE", section_fmt
-        )
-        for col_idx, col_name in enumerate(payload["campaigns"].columns):
-            ws.write(4, col_idx, col_name, header_fmt)
+        last_campaign_col = max(0, len(campaigns.columns) - 1)
+        banner(ws, last_campaign_col, "SPN | CAMPAIGN PERFORMANCE DETAIL", f"ALL RETURNED CAMPAIGNS     •     {period}")
         ws.set_row(4, 34)
         ws.freeze_panes(5, 2)
-        ws.autofilter(4, 0, 4 + len(payload["campaigns"]), max(0, len(payload["campaigns"].columns) - 1))
-        widths = {"Kategori": 13, "Campaign": 42, "Spend (Rp)": 16, "Impressions": 14, "Reach": 14, "Clicks": 12, "CTR (%)": 12, "Profile Visits": 16, "Follower By Ads": 16, "Frequency": 12}
-        for col_idx, col_name in enumerate(payload["campaigns"].columns):
-            ws.set_column(col_idx, col_idx, widths.get(col_name, 16))
-            if col_name == "Spend (Rp)":
-                ws.set_column(col_idx, col_idx, widths.get(col_name, 16), money_fmt)
-            elif col_name == "CTR (%)":
-                ws.set_column(col_idx, col_idx, widths.get(col_name, 16), percent_fmt)
-            elif col_name != "Campaign" and col_name != "Kategori":
-                ws.set_column(col_idx, col_idx, widths.get(col_name, 16), number_fmt)
-        if len(payload["campaigns"]):
-            ws.conditional_format(5, 2, 4 + len(payload["campaigns"]), 2, {"type": "data_bar", "bar_color": blue})
-        # Daily trend
-        ws = writer.sheets["Daily Trend"]
-        ws.merge_range("A3:D3", "TREN HARIAN", section_fmt)
-        for col_idx, col_name in enumerate(payload["daily"].columns):
+        if len(campaigns.columns):
+            ws.autofilter(4, 0, 4 + len(campaigns), len(campaigns.columns) - 1)
+        widths = {"Kategori": 13, "Campaign": 43, "Spend (Rp)": 18, "Impressions": 15,
+                  "Reach": 14, "Clicks": 13, "CTR (%)": 12, "Profile Visits": 16,
+                  "Follower By Ads": 17, "Frequency": 12}
+        for col_idx, col_name in enumerate(campaigns.columns):
+            default_fmt = money_fmt if col_name == "Spend (Rp)" else (percent_fmt if col_name == "CTR (%)" else (number_fmt if col_name not in ("Campaign", "Kategori") else body_fmt))
+            ws.set_column(col_idx, col_idx, widths.get(col_name, 16), default_fmt)
+        for col_idx, col_name in enumerate(campaigns.columns):
             ws.write(4, col_idx, col_name, header_fmt)
-        ws.set_row(4, 32)
+        if len(campaigns) and "Spend (Rp)" in campaigns.columns:
+            spend_col = list(campaigns.columns).index("Spend (Rp)")
+            ws.conditional_format(5, spend_col, 4 + len(campaigns), spend_col,
+                                  {"type": "data_bar", "bar_color": blue, "bar_solid": True})
+        ws.repeat_rows(4)
+
+        # DAILY TREND
+        ws = writer.sheets["Daily Trend"]
+        last_daily_col = max(0, len(daily.columns) - 1)
+        banner(ws, max(last_daily_col, 7), "SPN | DAILY PERFORMANCE", f"DAILY MEDIA SPEND & FOLLOWER ACTIVITY     •     {period}")
         ws.set_column("A:A", 18, date_fmt)
-        ws.set_column("B:C", 18, money_fmt)
+        ws.set_column("B:C", 20, money_fmt)
         ws.set_column("D:D", 18, number_fmt)
-        ws.autofilter(4, 0, 4 + len(payload["daily"]), max(0, len(payload["daily"].columns) - 1))
-        for row_idx, day_value in enumerate(payload["daily"]["Tanggal"], start=5):
-            if pd.notna(day_value):
-                ws.write_datetime(row_idx, 0, pd.Timestamp(day_value).to_pydatetime(), date_fmt)
-        if len(payload["daily"]):
-            chart = workbook.add_chart({"type": "line"})
-            n = len(payload["daily"])
-            for col, label in [(1, "Traffic"), (2, "Leads")]:
-                chart.add_series({"name": label, "categories": ["Daily Trend", 5, 0, 4 + n, 0], "values": ["Daily Trend", 5, col, 4 + n, col]})
-            chart.set_title({"name": "Daily Ad Spend"})
-            chart.set_legend({"position": "bottom"})
-            chart.set_y_axis({"name": "Spend (Rp)", "num_format": '"Rp" #,##0'})
-            chart.set_size({"width": 700, "height": 300})
-            ws.insert_chart("F4", chart)
+        ws.set_column("F:M", 13)
+        ws.set_row(4, 30)
+        for col_idx, col_name in enumerate(daily.columns):
+            ws.write(4, col_idx, col_name, header_fmt)
+        ws.autofilter(4, 0, 4 + len(daily), max(0, len(daily.columns) - 1))
+        ws.freeze_panes(5, 0)
+        ws.repeat_rows(4)
+        if len(daily):
+            for col_idx, col_name in enumerate(daily.columns):
+                if col_name == "Tanggal":
+                    ws.set_column(col_idx, col_idx, 18, date_fmt)
+                elif "Spend" in str(col_name) or col_name in ("Traffic", "Leads"):
+                    ws.set_column(col_idx, col_idx, 20, money_fmt)
+                else:
+                    ws.set_column(col_idx, col_idx, 18, number_fmt)
+            spend_chart = workbook.add_chart({"type": "line"})
+            last_row = 4 + len(daily)
+            for col_idx, label in ((1, "Traffic Spend"), (2, "Leads Spend")):
+                if col_idx < len(daily.columns):
+                    spend_chart.add_series({
+                        "name": label, "categories": ["Daily Trend", 5, 0, last_row, 0],
+                        "values": ["Daily Trend", 5, col_idx, last_row, col_idx],
+                        "line": {"width": 2.25, "color": blue if col_idx == 1 else magenta},
+                    })
+            spend_chart.set_title({"name": "Daily Ad Spend", "name_font": {"size": 12, "bold": True, "color": navy}})
+            spend_chart.set_legend({"position": "bottom"})
+            spend_chart.set_x_axis({"date_axis": True, "num_format": "dd mmm", "label_position": "low"})
+            spend_chart.set_y_axis({"name": "Spend (IDR)", "num_format": '"Rp" #,##0', "major_gridlines": {"visible": True, "line": {"color": border}}})
+            spend_chart.set_chartarea({"border": {"none": True}, "fill": {"color": white}})
+            spend_chart.set_plotarea({"border": {"none": True}, "fill": {"color": white}})
+            spend_chart.set_size({"width": 720, "height": 310})
+            ws.insert_chart("F5", spend_chart)
+
+            if "Follower baru" in daily.columns and daily["Follower baru"].notna().any():
+                follower_col = list(daily.columns).index("Follower baru")
+                follower_chart = workbook.add_chart({"type": "line"})
+                follower_chart.add_series({
+                    "name": "Follower baru", "categories": ["Daily Trend", 5, 0, last_row, 0],
+                    "values": ["Daily Trend", 5, follower_col, last_row, follower_col],
+                    "line": {"width": 2.5, "color": teal},
+                    "marker": {"type": "circle", "size": 4, "border": {"color": teal}, "fill": {"color": white}},
+                })
+                follower_chart.set_title({"name": "Daily Follower Activity", "name_font": {"size": 12, "bold": True, "color": navy}})
+                follower_chart.set_legend({"none": True})
+                follower_chart.set_x_axis({"date_axis": True, "num_format": "dd mmm", "label_position": "low"})
+                follower_chart.set_y_axis({"name": "Followers", "major_gridlines": {"visible": True, "line": {"color": border}}})
+                follower_chart.set_chartarea({"border": {"none": True}, "fill": {"color": white}})
+                follower_chart.set_plotarea({"border": {"none": True}, "fill": {"color": white}})
+                follower_chart.set_size({"width": 720, "height": 280})
+                ws.insert_chart("F22", follower_chart)
         if payload.get("follower_error"):
-            note_row = 6 + len(payload["daily"])
-            ws.merge_range(note_row, 0, note_row + 1, max(0, len(payload["daily"].columns) - 1),
-                           "Catatan Instagram Insights: " + str(payload["follower_error"]), note_fmt)
+            note_row = max(7, 7 + len(daily))
+            ws.merge_range(note_row, 0, note_row + 1, max(3, last_daily_col),
+                           "Instagram Insights note: " + str(payload["follower_error"]), note_fmt)
             ws.set_row(note_row, 30)
             ws.set_row(note_row + 1, 24)
+
+        # Consistent print setup and workbook metadata.
+        workbook.set_properties({
+            "title": "SPN Instagram Ads Performance Report",
+            "subject": "Instagram Ads, Community Funnel and Campaign Performance",
+            "author": "SPN Data Explorer",
+            "company": "Smart Parents Network",
+            "comments": "Generated from the selected reporting period in SPN Data Explorer.",
+        })
+        for sheet_name in writer.sheets:
+            sheet = writer.sheets[sheet_name]
+            sheet.set_print_scale(85)
+            sheet.set_margins(0.25, 0.25, 0.45, 0.45)
     return output.getvalue()
 
-
 def _pdf_report(payload) -> bytes:
-    """PDF landscape dengan ringkasan, funnel, tabel campaign, dan tren harian."""
+    """PDF report dengan executive summary, KPI cards, objective, campaign, dan daily detail."""
     from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, LongTable, Flowable
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak,
+        LongTable, Flowable, KeepTogether,
+    )
 
-    navy = colors.HexColor("#1A1464")
+    navy = colors.HexColor("#172554")
     blue = colors.HexColor("#497CD6")
-    pale = colors.HexColor("#EAF1FF")
-    muted = colors.HexColor("#65718F")
+    blue_light = colors.HexColor("#EAF1FF")
+    teal = colors.HexColor("#168C88")
+    teal_light = colors.HexColor("#E7F5F3")
+    gold = colors.HexColor("#C58A25")
+    gold_light = colors.HexColor("#FFF5DF")
+    magenta = colors.HexColor("#C0266D")
+    magenta_light = colors.HexColor("#FCEAF2")
+    muted = colors.HexColor("#68758F")
     ink = colors.HexColor("#24304F")
+    border = colors.HexColor("#DCE4F0")
+    soft = colors.HexColor("#F5F7FB")
+    white = colors.white
 
-    class ReportLineChart(Flowable):
-        def __init__(self, series, width=245*mm, height=32*mm, title="Tren harian"):
-            super().__init__()
-            self.series, self.width, self.height, self.title = series, width, height, title
-        def draw(self):
-            c = self.canv
-            c.setFont("Helvetica-Bold", 9)
-            c.setFillColor(navy)
-            c.drawString(0, self.height - 10, self.title)
-            left, bottom, top = 28, 17, self.height - 20
-            right = self.width - 8
-            points = [v for _, vals, _ in self.series for v in vals if v is not None and pd.notna(v)]
-            if not points:
-                c.setFillColor(muted); c.setFont("Helvetica", 8); c.drawString(left, bottom + 15, "Tidak ada data harian.")
-                return
-            ymin, ymax = min(0, min(points)), max(points)
-            if ymax <= ymin: ymax = ymin + 1
-            c.setStrokeColor(colors.HexColor("#D9E1F2")); c.setLineWidth(.5)
-            for i in range(4):
-                y = bottom + (top-bottom)*i/3
-                c.line(left, y, right, y)
-            c.setFont("Helvetica", 6.5); c.setFillColor(muted)
-            c.drawString(0, bottom, f"{ymin:,.0f}")
-            c.drawString(0, top-2, f"{ymax:,.0f}")
-            palette = [blue, colors.HexColor("#D91A7D"), colors.HexColor("#2D9C9A")]
-            chart_dates = next((dates for _, _, dates in self.series if dates), [])
-            if chart_dates:
-                c.setFillColor(muted); c.setFont("Helvetica", 6.5)
-                first = pd.to_datetime(chart_dates[0], errors="coerce")
-                last = pd.to_datetime(chart_dates[-1], errors="coerce")
-                if pd.notna(first) and pd.notna(last):
-                    c.drawRightString(right, self.height - 10, f"{first:%d %b} - {last:%d %b}")
-            for si, (label, values, dates) in enumerate(self.series):
-                valid = [(i, v) for i, v in enumerate(values) if v is not None and pd.notna(v)]
-                if not valid: continue
-                c.setStrokeColor(palette[si % len(palette)]); c.setLineWidth(1.6)
-                prev = None
-                n = max(len(values)-1, 1)
-                for i, v in valid:
-                    x = left + (right-left)*i/n
-                    y = bottom + (top-bottom)*(float(v)-ymin)/(ymax-ymin)
-                    if prev: c.line(prev[0], prev[1], x, y)
-                    c.setFillColor(palette[si % len(palette)]); c.circle(x, y, 1.5, stroke=0, fill=1)
-                    prev = (x, y)
-                c.setFillColor(palette[si % len(palette)]); c.setFont("Helvetica", 7)
-                c.drawString(left + si*55, 2, label)
-
+    page_size = landscape(A4)
+    page_width, page_height = page_size
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=13*mm, leftMargin=13*mm, topMargin=17*mm, bottomMargin=15*mm, title="SPN Instagram Ads Performance Report")
+    doc = SimpleDocTemplate(
+        buffer, pagesize=page_size, rightMargin=13*mm, leftMargin=13*mm,
+        topMargin=17*mm, bottomMargin=16*mm,
+        title="SPN Instagram Ads Performance Report",
+        author="SPN Data Explorer", subject="Instagram Ads and Community Performance",
+    )
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=19, leading=23, textColor=navy, alignment=TA_LEFT, spaceAfter=4))
-    styles.add(ParagraphStyle(name="ReportSub", parent=styles["Normal"], fontSize=9, textColor=muted, spaceAfter=10))
-    styles.add(ParagraphStyle(name="Section", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11, leading=14, textColor=navy, spaceBefore=8, spaceAfter=6))
-    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=7, leading=9, textColor=ink))
+    styles.add(ParagraphStyle(name="Brand", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=8, leading=10, textColor=white, alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="HeroTitle", parent=styles["Title"], fontName="Helvetica-Bold",
+                              fontSize=19, leading=22, textColor=white, alignment=TA_LEFT, spaceAfter=2))
+    styles.add(ParagraphStyle(name="HeroSub", parent=styles["Normal"], fontSize=8.5, leading=11,
+                              textColor=colors.HexColor("#D9E4F7"), alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="SectionPro", parent=styles["Heading2"], fontName="Helvetica-Bold",
+                              fontSize=10.5, leading=13, textColor=navy, spaceBefore=6, spaceAfter=5))
+    styles.add(ParagraphStyle(name="SectionNote", parent=styles["Normal"], fontSize=7.5, leading=9,
+                              textColor=muted, spaceAfter=5))
+    styles.add(ParagraphStyle(name="KpiLabel", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=6.7, leading=8, textColor=muted, alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="KpiValue", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=14, leading=17, textColor=navy, alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="TableHeader", parent=styles["Normal"], fontName="Helvetica-Bold",
+                              fontSize=6.6, leading=7.8, textColor=white))
+    styles.add(ParagraphStyle(name="TableCell", parent=styles["Normal"], fontSize=6.5, leading=8,
+                              textColor=ink))
+    styles.add(ParagraphStyle(name="TableCellRight", parent=styles["Normal"], fontSize=6.5, leading=8,
+                              textColor=ink, alignment=TA_RIGHT))
+    styles.add(ParagraphStyle(name="SmallPro", parent=styles["Normal"], fontSize=7, leading=9,
+                              textColor=muted))
 
-    def fmt_num(v):
-        return "-" if v is None or pd.isna(v) else f"{float(v):,.0f}".replace(",", ".")
-    def fmt_rp(v):
-        return "-" if v is None or pd.isna(v) else "Rp " + fmt_num(v)
-    def styled_table(data, widths=None, header=True, font=7):
-        t = Table(data, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
-        cmds = [
+    def number(value, decimals=0):
+        return "-" if value is None or pd.isna(value) else f"{float(value):,.{decimals}f}".replace(",", ".")
+
+    def money(value):
+        return "-" if value is None or pd.isna(value) else "Rp " + number(value)
+
+    def lookup_metric(metric_name, column="Total / Global"):
+        found = payload["metrics"].loc[payload["metrics"]["Metrik"] == metric_name]
+        if found.empty or column not in found:
+            return None
+        value = found.iloc[0][column]
+        return None if value is None or pd.isna(value) else float(value)
+
+    def lookup_funnel(prefix):
+        found = payload["funnel"].loc[payload["funnel"]["Metrik"].astype(str).str.startswith(prefix)]
+        if found.empty:
+            return None
+        value = found.iloc[0]["Nilai"]
+        return None if value is None or pd.isna(value) else float(value)
+
+    def kpi_card(label, value, accent, bg, value_is_money=False, value_is_percent=False):
+        display = money(value) if value_is_money else (f"{number(value, 2)}%" if value_is_percent and value is not None and pd.notna(value) else number(value))
+        card = Table([
+            [Paragraph(label.upper(), styles["KpiLabel"])],
+            [Paragraph(display, styles["KpiValue"])],
+        ], colWidths=[63*mm], rowHeights=[8*mm, 13*mm])
+        card.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), bg),
+            ("BOX", (0,0), (-1,-1), .55, border),
+            ("LINEBEFORE", (0,0), (0,-1), 2.5, accent),
+            ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 6),
+            ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        return card
+
+    def section(title, subtitle=None):
+        blocks = [Paragraph(title.upper(), styles["SectionPro"])]
+        if subtitle:
+            blocks.append(Paragraph(subtitle, styles["SectionNote"]))
+        return blocks
+
+    def table_style(header=True, font_size=7, highlight_first=False):
+        commands = [
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
             ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
             ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-            ("GRID", (0,0), (-1,-1), .35, colors.HexColor("#DFE6F2")),
-            ("FONTSIZE", (0,0), (-1,-1), font), ("TEXTCOLOR", (0,0), (-1,-1), ink),
+            ("LINEBELOW", (0,0), (-1,-1), .35, border),
+            ("FONTSIZE", (0,0), (-1,-1), font_size),
+            ("TEXTCOLOR", (0,0), (-1,-1), ink),
         ]
         if header:
-            cmds += [("BACKGROUND", (0,0), (-1,0), navy), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold")]
-            if len(data) > 1:
-                cmds += [("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, pale])]
-        t.setStyle(TableStyle(cmds))
-        return t
+            commands += [
+                ("BACKGROUND", (0,0), (-1,0), navy),
+                ("TEXTCOLOR", (0,0), (-1,0), white),
+                ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                ("LINEBELOW", (0,0), (-1,0), 1, blue),
+            ]
+            if highlight_first:
+                commands += [("BACKGROUND", (0,1), (-1,1), blue_light)]
+            elif len(commands) > 1:
+                commands += [("ROWBACKGROUNDS", (0,1), (-1,-1), [white, soft])]
+        return TableStyle(commands)
 
-    story = [
-        Paragraph("SPN | INSTAGRAM ADS PERFORMANCE REPORT", styles["ReportTitle"]),
-        Paragraph(f"Periode laporan: {payload['start']:%d %b %Y} – {payload['end']:%d %b %Y}  ·  Dibuat: {datetime.now():%d %b %Y, %H:%M}", styles["ReportSub"]),
-        Paragraph("Ringkasan KPI", styles["Section"]),
+    class ReportLineChart(Flowable):
+        def __init__(self, series, title, width=270*mm, height=49*mm, currency=False):
+            super().__init__()
+            self.series = series
+            self.title = title
+            self.width = width
+            self.height = height
+            self.currency = currency
+        def draw(self):
+            c = self.canv
+            c.setFillColor(white)
+            c.setStrokeColor(border)
+            c.roundRect(0, 0, self.width, self.height, 5, stroke=1, fill=1)
+            c.setFillColor(navy)
+            c.setFont("Helvetica-Bold", 9)
+            c.drawString(9, self.height - 12, self.title)
+            left, right = 42, self.width - 13
+            bottom, top = 15, self.height - 23
+            values = [float(v) for _, vals, _ in self.series for v in vals if v is not None and pd.notna(v)]
+            if not values:
+                c.setFillColor(muted); c.setFont("Helvetica", 8)
+                c.drawString(left, bottom + 12, "No daily data available for this period.")
+                return
+            ymin = min(0, min(values))
+            ymax = max(values)
+            if ymax <= ymin:
+                ymax = ymin + 1
+            for tick in range(4):
+                y = bottom + (top - bottom) * tick / 3
+                c.setStrokeColor(border); c.setLineWidth(.4); c.line(left, y, right, y)
+                v = ymin + (ymax - ymin) * tick / 3
+                c.setFillColor(muted); c.setFont("Helvetica", 5.8)
+                label = f"{v/1_000_000:.1f}m" if self.currency and v >= 1_000_000 else (f"{v/1_000:.0f}k" if self.currency and v >= 1_000 else f"{v:,.0f}")
+                c.drawRightString(left - 5, y - 2, label)
+            palette = [blue, magenta, teal]
+            max_n = max((len(vals) for _, vals, _ in self.series), default=1)
+            for idx, (label, vals, dates) in enumerate(self.series):
+                pts = [(i, float(v)) for i, v in enumerate(vals) if v is not None and pd.notna(v)]
+                if not pts:
+                    continue
+                c.setStrokeColor(palette[idx % len(palette)])
+                c.setFillColor(palette[idx % len(palette)])
+                c.setLineWidth(1.9)
+                prev = None
+                for i, val in pts:
+                    x = left + (right-left) * (i / max(max_n-1, 1))
+                    y = bottom + (top-bottom) * ((val-ymin)/(ymax-ymin))
+                    if prev:
+                        c.line(prev[0], prev[1], x, y)
+                    c.circle(x, y, 1.5, stroke=0, fill=1)
+                    prev = (x, y)
+            # compact legend
+            legend_x = left
+            for idx, (label, _, _) in enumerate(self.series):
+                c.setStrokeColor(palette[idx % len(palette)]); c.setLineWidth(2)
+                c.line(legend_x, 6, legend_x + 10, 6)
+                c.setFillColor(muted); c.setFont("Helvetica", 6.5)
+                c.drawString(legend_x + 13, 4, label)
+                legend_x += 60
+
+    def hero_header():
+        brand_cell = Table([[Paragraph("SPN", styles["Brand"])]], colWidths=[22*mm], rowHeights=[25*mm])
+        brand_cell.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), blue), ("ALIGN", (0,0), (-1,-1), "CENTER"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("BOX", (0,0), (-1,-1), 0, blue),
+        ]))
+        period = f"{payload['start']:%d %b %Y} - {payload['end']:%d %b %Y}"
+        title_block = Table([
+            [Paragraph("INSTAGRAM ADS PERFORMANCE", styles["HeroTitle"])],
+            [Paragraph(f"PERFORMANCE REPORT&nbsp;&nbsp; | &nbsp;&nbsp;{period}", styles["HeroSub"])],
+            [Paragraph(f"Generated {datetime.now():%d %b %Y, %H:%M} WIB&nbsp;&nbsp; • &nbsp;&nbsp;Internal report", styles["HeroSub"])],
+        ], colWidths=[237*mm], rowHeights=[10*mm, 7*mm, 6*mm])
+        title_block.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), navy), ("LEFTPADDING", (0,0), (-1,-1), 10),
+            ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 2),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 1), ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        hero = Table([[brand_cell, title_block]], colWidths=[22*mm, 237*mm], rowHeights=[25*mm])
+        hero.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), navy), ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), 0),
+            ("TOPPADDING", (0,0), (-1,-1), 0), ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+        ]))
+        return hero
+
+    story = [hero_header(), Spacer(1, 5*mm)]
+    story += section("Executive snapshot", "Key indicators for the selected reporting period.")
+    cards = [
+        kpi_card("Total Ad Spend", lookup_metric("Total Spend (Rp)"), blue, blue_light, True),
+        kpi_card("Profile Visits", lookup_metric("Result", "Traffic"), teal, teal_light),
+        kpi_card("Community Joins", lookup_funnel("Total Join Community"), gold, gold_light),
+        kpi_card("Conversion Rate", lookup_funnel("CR"), magenta, magenta_light, value_is_percent=True),
+        kpi_card("Acquisition Cost", lookup_funnel("CAC"), blue, blue_light, True),
+        kpi_card("Followers From Ads", lookup_metric("Follower By Ads"), teal, teal_light),
+        kpi_card("Instagram Followers", lookup_metric("Follower Asli IG"), gold, gold_light),
+        kpi_card("Impressions", lookup_metric("Impressions"), magenta, magenta_light),
     ]
-    m = payload["metrics"]
-    metric_rows = [["Metrik", "Traffic", "Leads", "Total / Global"]]
-    for _, row in m.iterrows():
-        vals=[]
-        for col in ("Traffic", "Leads", "Total / Global"):
-            v = row[col]
-            vals.append(fmt_rp(v) if "Spend" in row["Metrik"] or "Cost" in row["Metrik"] or "CPF" in row["Metrik"] else fmt_num(v))
-        metric_rows.append([row["Metrik"], *vals])
-    story.append(styled_table(metric_rows, [70*mm, 42*mm, 42*mm, 48*mm], font=7.5))
+    for row_i in range(2):
+        row_cards = cards[row_i*4:(row_i+1)*4]
+        card_row = Table([row_cards], colWidths=[64.5*mm]*4, hAlign="LEFT")
+        card_row.setStyle(TableStyle([
+            ("LEFTPADDING", (0,0), (-1,-1), 0), ("RIGHTPADDING", (0,0), (-1,-1), 2.5),
+            ("TOPPADDING", (0,0), (-1,-1), 0), ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+        ]))
+        story.append(card_row)
+        story.append(Spacer(1, 2.2*mm))
 
-    story.append(Paragraph("Konversi ke Community", styles["Section"]))
-    f = payload["funnel"]
-    frow = [["Profile Visits", "Total Join Community", "CR", "CAC"]]
-    vals = [f.iloc[0]["Nilai"], f.iloc[1]["Nilai"], f.iloc[2]["Nilai"], f.iloc[3]["Nilai"]]
-    frow.append([fmt_num(vals[0]), fmt_num(vals[1]), ("-" if vals[2] is None or pd.isna(vals[2]) else f"{float(vals[2]):,.2f}%"), fmt_rp(vals[3])])
-    story.append(styled_table(frow, [60*mm, 60*mm, 45*mm, 45*mm], font=8))
-
-    story.append(Paragraph("Performa per Objective", styles["Section"]))
+    story += section("Objective performance")
     obj = payload["objective"]
-    obj_rows = [["Objective", "Campaign", "Spend", "Result", "Cost / Result", "Follower By Ads", "CPF", "Impressions", "Reach"]]
+    obj_headers = ["Objective", "Campaigns", "Spend", "Result", "Cost / Result", "Followers", "CPF", "Impressions", "Reach"]
+    obj_rows = [[Paragraph(x, styles["TableHeader"]) for x in obj_headers]]
     for _, row in obj.iterrows():
-        obj_rows.append([row["Objective"], fmt_num(row["Campaign"]), fmt_rp(row["Spend (Rp)"]), fmt_num(row["Result"]), fmt_rp(row["Cost per Result (Rp)"]), fmt_num(row["Follower By Ads"]), fmt_rp(row["CPF (Rp)"]), fmt_num(row["Impressions"]), fmt_num(row["Reach"])])
-    story.append(styled_table(obj_rows, [24*mm, 18*mm, 30*mm, 22*mm, 30*mm, 26*mm, 25*mm, 24*mm, 22*mm], font=6.3))
+        obj_rows.append([
+            Paragraph(html_lib.escape(str(row.get("Objective", "-"))), styles["TableCell"]),
+            number(row.get("Campaign")), money(row.get("Spend (Rp)")), number(row.get("Result")),
+            money(row.get("Cost per Result (Rp)")), number(row.get("Follower By Ads")),
+            money(row.get("CPF (Rp)")), number(row.get("Impressions")), number(row.get("Reach")),
+        ])
+    obj_widths = [24*mm, 18*mm, 30*mm, 22*mm, 31*mm, 24*mm, 27*mm, 32*mm, 31*mm]
+    obj_table = Table(obj_rows, colWidths=obj_widths, repeatRows=1, hAlign="LEFT")
+    obj_table.setStyle(table_style(font_size=7, highlight_first=True))
+    story.append(obj_table)
 
     daily = payload["daily"]
-    if not daily.empty:
-        dates = daily["Tanggal"].tolist()
-        spend_series = [
-            ("Traffic Spend", daily["Traffic"].tolist(), dates),
-            ("Leads Spend", daily["Leads"].tolist(), dates),
-        ]
-        story += [Spacer(1, 4), ReportLineChart(spend_series, title="Daily Ad Spend (Rp)")]
 
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Detail Campaign", styles["ReportTitle"]))
-    story.append(Paragraph("Seluruh campaign yang dikembalikan oleh Meta pada periode terpilih.", styles["ReportSub"]))
+    # Page 2: campaign detail is intentionally separated for legibility and printing.
+    story.append(PageBreak())
+    story += section("Campaign performance detail", "All campaign rows returned by Meta for the selected period.")
     campaign_df = payload["campaigns"]
-    ccols = [c for c in ["Kategori", "Campaign", "Spend (Rp)", "Impressions", "Reach", "Clicks", "CTR (%)", "Profile Visits", "Follower By Ads"] if c in campaign_df.columns]
-    cdata = [["Kategori", "Campaign", "Spend", "Impr.", "Reach", "Clicks", "CTR", "Profile Visits", "Follows"]]
-    for _, r in campaign_df[ccols].iterrows():
-        cdata.append([
-            str(r.get("Kategori", "")), Paragraph(html_lib.escape(str(r.get("Campaign", ""))[:120]), styles["Small"]),
-            fmt_rp(r.get("Spend (Rp)")), fmt_num(r.get("Impressions")), fmt_num(r.get("Reach")),
-            fmt_num(r.get("Clicks")), ("-" if pd.isna(r.get("CTR (%)")) else f"{float(r.get('CTR (%)')):,.2f}%"),
-            fmt_num(r.get("Profile Visits")), fmt_num(r.get("Follower By Ads")),
-        ])
-    if len(cdata) == 1:
-        cdata.append(["-", "Tidak ada data campaign", "-", "-", "-", "-", "-", "-", "-"])
-    campaign_table = LongTable(cdata, colWidths=[22*mm, 66*mm, 27*mm, 21*mm, 20*mm, 19*mm, 18*mm, 25*mm, 22*mm], repeatRows=1)
-    campaign_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), navy), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 6.3),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#DFE6F2")),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, pale]),
-        ("LEFTPADDING", (0,0), (-1,-1), 4), ("RIGHTPADDING", (0,0), (-1,-1), 4),
-        ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-    ]))
+    campaign_columns = [
+        ("Kategori", "Objective"), ("Campaign", "Campaign"), ("Spend (Rp)", "Spend"),
+        ("Impressions", "Impressions"), ("Reach", "Reach"), ("Clicks", "Clicks"),
+        ("CTR (%)", "CTR"), ("Profile Visits", "Profile Visits"),
+        ("Follower By Ads", "Followers"),
+    ]
+    available = [(src, label) for src, label in campaign_columns if src in campaign_df.columns]
+    campaign_header = [Paragraph(label, styles["TableHeader"]) for _, label in available]
+    campaign_rows = [campaign_header]
+    for _, row in campaign_df.iterrows():
+        cells = []
+        for src, _ in available:
+            val = row.get(src)
+            if src == "Campaign":
+                cells.append(Paragraph(html_lib.escape(str(val or "-"))[:240], styles["TableCell"]))
+            elif src == "Kategori":
+                cells.append(Paragraph(html_lib.escape(str(val or "-")), styles["TableCell"]))
+            elif src == "Spend (Rp)":
+                cells.append(money(val))
+            elif src == "CTR (%)":
+                cells.append("-" if val is None or pd.isna(val) else f"{float(val):,.2f}%")
+            else:
+                cells.append(number(val))
+        campaign_rows.append(cells)
+    if not campaign_rows or len(campaign_rows) == 1:
+        campaign_rows.append(["-", "No campaign data", *(["-"] * max(0, len(available)-2))])
+    c_widths_map = {
+        "Kategori": 22*mm, "Campaign": 67*mm, "Spend (Rp)": 29*mm,
+        "Impressions": 25*mm, "Reach": 22*mm, "Clicks": 19*mm,
+        "CTR (%)": 18*mm, "Profile Visits": 27*mm, "Follower By Ads": 26*mm,
+    }
+    campaign_widths = [c_widths_map[src] for src, _ in available]
+    campaign_table = LongTable(campaign_rows, colWidths=campaign_widths, repeatRows=1, hAlign="LEFT")
+    campaign_table.setStyle(table_style(font_size=6.6))
     story.append(campaign_table)
 
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Daily Data", styles["Section"]))
-    story.append(Paragraph("Belanja harian berdasarkan objective dan data follower baru dari Instagram Insights jika tersedia.", styles["ReportSub"]))
+    # Page 3: daily table and follower series, when available.
+    story.append(PageBreak())
+    story += section("Daily trend & reporting detail", "Daily spend and follower activity within the selected period.")
+    if not daily.empty:
+        story.append(ReportLineChart([
+            ("Traffic spend", daily["Traffic"].tolist(), daily["Tanggal"].tolist()),
+            ("Leads spend", daily["Leads"].tolist(), daily["Tanggal"].tolist()),
+        ], "DAILY AD SPEND", currency=True, height=34*mm))
+        follower_values = daily["Follower baru"].tolist() if "Follower baru" in daily.columns else []
+        if any(v is not None and pd.notna(v) for v in follower_values):
+            story.append(Spacer(1, 4*mm))
+            story.append(ReportLineChart([("Follower activity", follower_values, daily["Tanggal"].tolist())],
+                                         "DAILY FOLLOWER ACTIVITY", currency=False, height=29*mm))
+        story.append(Spacer(1, 5*mm))
+        daily_headers = [Paragraph(x, styles["TableHeader"]) for x in ["Date", "Traffic Spend", "Leads Spend", "New Followers"]]
+        daily_rows = [daily_headers]
+        for _, row in daily.iterrows():
+            d = row.get("Tanggal")
+            d_label = d.strftime("%d %b %Y") if pd.notna(d) else "-"
+            follower = row.get("Follower baru") if "Follower baru" in daily.columns else None
+            daily_rows.append([d_label, money(row.get("Traffic")), money(row.get("Leads")), number(follower)])
+        daily_table = LongTable(daily_rows, colWidths=[48*mm, 60*mm, 60*mm, 50*mm], repeatRows=1, hAlign="LEFT")
+        daily_table.setStyle(table_style(font_size=6.9))
+        daily_table.setStyle(TableStyle([
+            ("TOPPADDING", (0,0), (-1,-1), 2.8),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 2.8),
+        ]))
+        story.append(daily_table)
+    else:
+        story.append(Paragraph("No daily data available for the selected period.", styles["SmallPro"]))
     if payload.get("follower_error"):
-        story.append(Paragraph("Catatan Instagram Insights: " + html_lib.escape(str(payload["follower_error"])), styles["Small"]))
-        story.append(Spacer(1, 4))
-    ddata = [["Tanggal", "Traffic Spend", "Leads Spend", "Follower baru"]]
-    for _, row in daily.iterrows():
-        d = row["Tanggal"]
-        ddata.append([d.strftime("%d %b %Y") if pd.notna(d) else "-", fmt_rp(row.get("Traffic")), fmt_rp(row.get("Leads")), fmt_num(row.get("Follower baru"))])
-    if len(ddata) == 1:
-        ddata.append(["-", "-", "-", "-"])
-    story.append(LongTable(ddata, colWidths=[45*mm, 48*mm, 48*mm, 45*mm], repeatRows=1, style=TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), navy), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 7.5),
-        ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#DFE6F2")),
-        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, pale]),
-        ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
-    ])))
+        story.append(Spacer(1, 4*mm))
+        story.append(Paragraph("Instagram Insights: " + html_lib.escape(str(payload["follower_error"])), styles["SmallPro"]))
 
     def page_decor(canvas, doc_):
         canvas.saveState()
-        w, h = landscape(A4)
-        canvas.setStrokeColor(blue); canvas.setLineWidth(1.2); canvas.line(13*mm, h-10*mm, w-13*mm, h-10*mm)
-        canvas.setFont("Helvetica", 7); canvas.setFillColor(muted)
-        canvas.drawString(13*mm, 7*mm, "SPN · Internal Performance Report")
-        canvas.drawRightString(w-13*mm, 7*mm, f"Page {doc_.page}")
+        w, h = page_size
+        canvas.setFillColor(navy)
+        canvas.rect(0, h - 4*mm, w, 4*mm, stroke=0, fill=1)
+        canvas.setStrokeColor(border)
+        canvas.setLineWidth(.45)
+        canvas.line(13*mm, 11*mm, w - 13*mm, 11*mm)
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 7)
+        canvas.drawString(13*mm, 6.5*mm, "SPN DATA EXPLORER  |  INTERNAL & CONFIDENTIAL")
+        canvas.drawRightString(w - 13*mm, 6.5*mm, f"PAGE {doc_.page}")
         canvas.restoreState()
+
     doc.build(story, onFirstPage=page_decor, onLaterPages=page_decor)
     return buffer.getvalue()
-
 
 def render_export_panel(ctx: Ctx, raw_campaigns):
     """Visible export panel with recognizable PDF and Excel file badges."""
