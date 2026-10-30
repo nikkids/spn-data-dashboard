@@ -19,6 +19,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -147,7 +148,7 @@ def graph(_client, version, path, params=(), paginate=True, token=None):
 
 def clear_meta_cache():
     """Hapus cache Meta Ads saja. Jangan pakai st.cache_data.clear(): itu ikut menghapus cache data SPN."""
-    for fn in (load_insights, load_campaigns, graph):
+    for fn in (load_insights, load_campaigns, graph, _spn_registrations):
         fn.clear()
 
 
@@ -396,221 +397,261 @@ def render_overview(ctx: Ctx, raw_campaigns):
                          hide_index=True, width="stretch")
 
 
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _spn_registrations(start: str, end: str, csv_path: str) -> int | None:
+    """Hitung pendaftar unik SPN dalam rentang tanggal yang sama dengan periode iklan."""
+    path = Path(csv_path)
+    if not path.is_absolute():
+        candidates = [Path.cwd() / path, Path(__file__).resolve().parent.parent / path]
+        path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    if not path.is_file():
+        return None
+    try:
+        raw = pd.read_csv(path, encoding="utf-8-sig", usecols=["timestamp", "email"])
+    except (ValueError, OSError, UnicodeError):
+        return None
+    dates = pd.to_datetime(raw["timestamp"], errors="coerce")
+    emails = raw["email"].fillna("").astype(str).str.strip().str.lower()
+    valid = (dates >= pd.Timestamp(start)) & (dates < pd.Timestamp(end) + pd.Timedelta(days=1))
+    valid &= emails.ne("")
+    return int(emails[valid].nunique())
+
+
+def _ad_follow_series(frame: pd.DataFrame) -> pd.Series:
+    """Jumlah follow Meta per campaign, memakai field native lalu fallback ke actions."""
+    if frame is None:
+        return pd.Series(dtype=float)
+    if frame.empty:
+        return pd.Series(0.0, index=frame.index)
+    if FOLLOW_FIELD in frame:
+        native = pd.to_numeric(frame[FOLLOW_FIELD], errors="coerce").fillna(0.0)
+        if float(native.sum()) > 0:
+            return native.astype(float)
+    totals = action_totals(frame)
+    follow_types = detect(totals, "follow")
+    if not follow_types or "actions" not in frame:
+        return pd.Series(0.0, index=frame.index)
+    return frame["actions"].map(
+        lambda acts: sum(action_map(acts).get(action, 0.0) for action in follow_types)
+    ).astype(float)
+
+
+def _ad_follow_count(frame: pd.DataFrame) -> float:
+    """Jumlah follow yang dilaporkan Meta untuk campaign dalam kategori aktif."""
+    return float(_ad_follow_series(frame).sum())
+
+
+def _instagram_profile_and_trend(ctx: Ctx):
+    """Ambil jumlah follower aktual dan net follows/unfollows harian dari Instagram Insights."""
+    ig_user_id = cfg("IG_USER_ID", cfg("INSTAGRAM_USER_ID", ""))
+    if not ig_user_id:
+        return None, pd.DataFrame(), "Isi IG_USER_ID pada Streamlit Secrets untuk menghubungkan akun Instagram."
+
+    profile = safe_run(
+        graph, ctx.client, ctx.version, str(ig_user_id),
+        (("fields", "username,followers_count"),), False
+    )
+    follower_total = None if not profile else profile.get("followers_count")
+
+    raw = safe_run(
+        graph, ctx.client, ctx.version, f"{ig_user_id}/insights",
+        (("metric", "follows_and_unfollows"),
+         ("period", "day"),
+         ("since", str(ctx.start)),
+         ("until", str(ctx.end))), False
+    )
+    rows = []
+    if isinstance(raw, dict):
+        for metric in raw.get("data", []):
+            for point in metric.get("values", []):
+                value = point.get("value") or {}
+                if isinstance(value, dict):
+                    follows = float(value.get("follows", 0) or 0)
+                    unfollows = float(value.get("unfollows", 0) or 0)
+                    rows.append({
+                        "Tanggal": pd.to_datetime(point.get("end_time"), errors="coerce").normalize(),
+                        "Follows": follows,
+                        "Unfollows": unfollows,
+                        "Perubahan bersih": follows - unfollows,
+                    })
+    trend = pd.DataFrame(rows)
+    if not trend.empty:
+        trend = trend.dropna(subset=["Tanggal"]).set_index("Tanggal").sort_index()
+        trend = trend[~trend.index.duplicated(keep="last")]
+    return follower_total, trend, None
+
+
 def render_stats(ctx: Ctx, category, raw_campaigns):
-    """Detail satu tujuan iklan; headline yang sudah ada tetap dipertahankan."""
-    S, E = ctx.start, ctx.end
-    campaigns = category_frame(raw_campaigns, category)
+    """Traffic dan Leads memakai susunan KPI yang sama; tren menampilkan perubahan follower IG."""
+    campaigns = category_frame(raw_campaigns, category) if raw_campaigns is not None else pd.DataFrame()
     if campaigns.empty:
         st.info(f"Belum ada campaign {category} pada periode ini.")
-        other_count = 0 if raw_campaigns is None or raw_campaigns.empty else int((raw_campaigns["dashboard_category"] == "Lainnya").sum())
-        if other_count:
-            with st.expander(f"Campaign lain yang belum terkategori ({other_count})", expanded=False):
-                cols = [c for c in ("campaign_name", "spend", "impressions") if c in raw_campaigns.columns]
-                st.dataframe(raw_campaigns.loc[raw_campaigns["dashboard_category"] == "Lainnya", cols],
-                             hide_index=True, width="stretch")
-        return
 
     campaigns = prepare_results(campaigns)
     spend = _series_sum(campaigns, "spend")
-    impressions = _series_sum(campaigns, "impressions")
-    clicks = _series_sum(campaigns, "clicks")
-    ctr = clicks / impressions * 100 if impressions else 0.0
-    n_campaigns = _campaign_count(campaigns)
-
-    ads = safe_run(load_insights, ctx.client, ctx.account, ctx.version, "ad", str(S), str(E),
-                   daily=False, fields=AD_FIELDS)
-    if ads is None or ads.empty:
-        n_ads = 0
-    else:
-        ads = category_frame(tag_campaigns(ads), category)
-        ads = ads[pd.to_numeric(ads["impressions"], errors="coerce").fillna(0) > 0] if not ads.empty else ads
-        n_ads = int(ads["ad_name"].nunique()) if not ads.empty and "ad_name" in ads else 0
+    ad_follows = _ad_follow_count(campaigns)
+    cost_per_follow = div(spend, ad_follows)
 
     if category == "Traffic":
-        visits = _series_sum(campaigns, "profile_visits")
-        headline_cards([
-            ("Total Spend", rp(spend)), ("IG Profile Visit", idn(visits)),
-            ("CPV (Traffic)", rp(div(spend, visits))), ("Impresi", idn(impressions)),
-            ("Reach", idn(_series_sum(campaigns, "reach"))), ("Klik", idn(clicks)),
-            ("CTR", f"{idn(ctr, 2)}%"), ("Content unik", idn(n_ads)),
-        ])
+        result = _series_sum(campaigns, "profile_visits")
+        result_label = "Kunjungan profil"
+        cost_per_result = div(spend, result)
     else:
         result_action = lead_action_choice(campaigns)
-        results = float(primary_action_per_campaign(campaigns, result_action).sum()) if result_action else None
-        headline_cards([
-            ("Total Spend", rp(spend)), ("Hasil Leads", idn(results) if results is not None else "-"),
-            ("Cost per Lead", rp(div(spend, results or 0) if results is not None else None)),
-            ("Impresi", idn(impressions)), ("Reach", idn(_series_sum(campaigns, "reach"))),
-            ("Klik", idn(clicks)), ("CTR", f"{idn(ctr, 2)}%"), ("Campaign", idn(n_campaigns)),
-        ])
-        if results is None:
-            st.caption("Hasil leads belum dikembalikan Meta untuk periode ini; metrik iklan lainnya tetap ditampilkan.")
+        meta_lead_results = (
+            float(primary_action_per_campaign(campaigns, result_action).sum())
+            if result_action else 0.0
+        )
+        csv_path = str(cfg("SPN_CSV_PATH", "master_penting_3.csv"))
+        registrations = _spn_registrations(str(ctx.start), str(ctx.end), csv_path)
+        result = registrations
+        result_label = "Pendaftar SPN unik"
+        cost_per_result = div(spend, registrations or 0) if registrations is not None else None
+
+    follower_total, follower_trend, follower_error = _instagram_profile_and_trend(ctx)
+
+    headline_cards([
+        ("Result", idn(result) if result is not None else "-", result_label),
+        ("Cost per Result", rp(cost_per_result), "Spend dibagi result pada periode terpilih"),
+        ("Follower By Ads", idn(ad_follows), "Follow yang dilaporkan Meta dari campaign ini"),
+        ("Follower Asli IG", idn(follower_total) if follower_total is not None else "-",
+         "Jumlah follower aktual akun Instagram"),
+        ("Cost Per Follow", rp(cost_per_follow), "Spend dibagi Follower By Ads"),
+        ("Total Spend", rp(spend), f"{category} · {ctx.start:%d %b %Y} – {ctx.end:%d %b %Y}"),
+    ])
+
+    if category == "Leads":
+        if result is None:
+            st.warning(
+                "Data pendaftar SPN belum dapat dibaca. Pastikan master_penting_3.csv tersedia "
+                "atau atur SPN_CSV_PATH pada Secrets."
+            )
+        else:
+            st.caption(
+                f"Cost per Result menggunakan {idn(result)} email unik yang mendaftar ke SPN "
+                f"pada {ctx.start:%d %b %Y}–{ctx.end:%d %b %Y}. "
+                "Hasil Leads dari Meta tidak dianggap sama dengan jumlah pendaftar SPN."
+            )
+            if meta_lead_results <= 0:
+                st.caption("Meta belum mengembalikan action Leads untuk campaign pada periode ini.")
 
     with st.container(border=True):
-        st.markdown('<div class="section-title">Tren harian</div>', unsafe_allow_html=True)
-        trend = _daily_category_trend(ctx, category)
-        if trend.empty:
-            st.info("Belum ada tren harian untuk kategori dan periode ini.")
+        st.markdown('<div class="section-title">Tren follower Instagram</div>', unsafe_allow_html=True)
+        if follower_error:
+            st.info(follower_error)
+        elif follower_trend.empty:
+            st.info(
+                "Data kenaikan/penurunan follower belum tersedia. Periksa izin Instagram Insights "
+                "dan pastikan IG_USER_ID mengarah ke Instagram Professional Account."
+            )
         else:
-            full_index = pd.date_range(pd.Timestamp(S), pd.Timestamp(E), freq="D")
-            trend = trend.reindex(full_index, fill_value=0)
-            trend.index.name = "Tanggal"
-            metric_label = st.segmented_control(
-                "Metrik tren", ["Belanja", "Impresi", "Klik"], default="Belanja",
-                key=f"mx_trend_metric_v3_{category}", label_visibility="collapsed", width="stretch",
-            ) or "Belanja"
-            metric_col = {"Belanja": "spend", "Impresi": "impressions", "Klik": "clicks"}[metric_label]
-            st.line_chart(trend[metric_col], height=260)
+            full_index = pd.date_range(pd.Timestamp(ctx.start), pd.Timestamp(ctx.end), freq="D")
+            plot = follower_trend.reindex(full_index, fill_value=0)
+            plot.index.name = "Tanggal"
+            st.caption("Perubahan bersih harian = follows baru − unfollows. Nilai positif berarti naik.")
+            st.line_chart(plot[["Perubahan bersih"]], height=280)
+            with st.expander("Rincian follows dan unfollows", expanded=False):
+                detail = plot.rename_axis("Tanggal").reset_index()
+                detail["Tanggal"] = detail["Tanggal"].dt.strftime("%d %b %Y")
+                st.dataframe(detail, hide_index=True, width="stretch")
 
-    # Table upfront: the most useful thing after the headline cards.
+    if campaigns.empty:
+        return
+
+    # Tabel dibuat konsisten di Traffic dan Leads. Result per campaign tetap memakai action Meta;
+    # pendaftar SPN hanya dihitung di KPI agregat karena tidak tersedia atribusi per campaign.
     display_raw = campaigns.sort_values("spend", ascending=False).copy()
     top = display_raw.head(10).copy()
+    result_by_campaign = (
+        top["profile_visits"].fillna(0)
+        if category == "Traffic"
+        else primary_action_per_campaign(top, lead_action_choice(campaigns))
+    )
     table = pd.DataFrame({
-        "Campaign": top.get("campaign_name", pd.Series(dtype=str)).fillna("-"),
-        "Belanja": top.get("spend", pd.Series(dtype=float)).map(rp),
-        "Impresi": top.get("impressions", pd.Series(dtype=float)).map(idn),
-        "Reach": top.get("reach", pd.Series(dtype=float)).map(idn),
-        "Klik": top.get("clicks", pd.Series(dtype=float)).map(idn),
-        "CTR": top.get("ctr", pd.Series(dtype=float)).map(lambda v: f"{idn(v, 2)}%"),
+        "Campaign": top.get("campaign_name", pd.Series("-", index=top.index)).fillna("-"),
+        "Spend": top.get("spend", pd.Series(0.0, index=top.index)).map(rp),
+        "Result dari Meta": result_by_campaign.map(idn),
+        "Follower By Ads": _ad_follow_series(top).map(idn),
     })
-    if category == "Traffic":
-        table["Kunjungan profil"] = top.get("profile_visits", pd.Series(dtype=float)).map(idn)
-    else:
-        action = lead_action_choice(campaigns)
-        action_counts = primary_action_per_campaign(top, action) if action else pd.Series(0, index=top.index)
-        table["Hasil Leads"] = action_counts.map(idn)
-
     with st.container(border=True):
-        st.markdown('<div class="section-title">Campaign dengan belanja terbesar</div>', unsafe_allow_html=True)
-        st.caption("Menampilkan 10 campaign teratas. Unduh CSV untuk melihat semua campaign pada periode ini.")
+        st.markdown('<div class="section-title">Performa campaign</div>', unsafe_allow_html=True)
+        st.caption(
+            "Result pada tabel adalah hasil yang dilaporkan Meta per campaign. "
+            "Jumlah pendaftar SPN digunakan pada KPI Cost per Result di atas."
+            if category == "Leads" else
+            "Result pada tabel adalah kunjungan profil Instagram yang dilaporkan Meta."
+        )
         st.dataframe(table, hide_index=True, width="stretch")
         st.download_button(
             "Download data campaign (CSV)",
             display_raw.to_csv(index=False).encode("utf-8"),
-            f"instagram_{category.lower()}_campaign_{S}_{E}.csv", "text/csv",
-            key=f"mx_download_top_v3_{category}",
+            f"instagram_{category.lower()}_campaign_{ctx.start}_{ctx.end}.csv",
+            "text/csv", key=f"mx_download_top_v4_{category}",
         )
 
     with st.expander("Analisis lanjutan", expanded=False):
         analysis = st.radio(
             "Apa yang ingin dilihat?", ["Rincian iklan", "Breakdown audiens", "Hasil dari Meta"],
-            horizontal=True, key=f"mx_advanced_kind_v3_{category}",
+            horizontal=True, key=f"mx_advanced_kind_v4_{category}",
         )
         if analysis == "Rincian iklan":
-            level_choice = st.selectbox("Tingkat rincian", ["Campaign", "Ad set", "Iklan"],
-                                        key=f"mx_level_v3_{category}")
+            level_choice = st.selectbox(
+                "Tingkat rincian", ["Campaign", "Ad set", "Iklan"],
+                key=f"mx_level_v4_{category}"
+            )
             level = {"Campaign": "campaign", "Ad set": "adset", "Iklan": "ad"}[level_choice]
             if level == "campaign":
                 detail = campaigns.copy()
             else:
-                detail_raw = safe_run(load_insights, ctx.client, ctx.account, ctx.version,
-                                      level, str(S), str(E))
+                detail_raw = safe_run(
+                    load_insights, ctx.client, ctx.account, ctx.version,
+                    level, str(ctx.start), str(ctx.end)
+                )
                 detail = tag_campaigns(detail_raw) if detail_raw is not None and not detail_raw.empty else pd.DataFrame()
                 detail = category_frame(detail, category) if not detail.empty else detail
             if detail is not None and not detail.empty:
-                label_col = {"campaign": "campaign_name", "adset": "adset_name", "ad": "ad_name"}[level]
                 names = [c for c in ("campaign_name", "adset_name", "ad_name") if c in detail.columns]
-                metrics = [c for c in METRICS if c in detail.columns]
-                shown = detail.sort_values("spend", ascending=False)[names + metrics]
-                label_map = {"campaign_name": "Campaign", "adset_name": "Ad set", "ad_name": "Iklan",
-                             "spend": "Belanja", "impressions": "Impresi", "reach": "Reach", "clicks": "Klik",
-                             "ctr": "CTR", "cpc": "CPC", "cpm": "CPM", "frequency": "Frekuensi"}
-                shown = shown.rename(columns=label_map)
+                detail_cols = names + [c for c in ("spend", FOLLOW_FIELD) if c in detail.columns]
+                shown = detail.sort_values("spend", ascending=False)[detail_cols].copy()
+                shown = shown.rename(columns={
+                    "campaign_name": "Campaign", "adset_name": "Ad set",
+                    "ad_name": "Iklan", "spend": "Spend", FOLLOW_FIELD: "Follower By Ads",
+                })
+                if "Spend" in shown:
+                    shown["Spend"] = shown["Spend"].map(rp)
+                if "Follower By Ads" in shown:
+                    shown["Follower By Ads"] = shown["Follower By Ads"].map(idn)
                 st.dataframe(shown, hide_index=True, width="stretch")
-                st.download_button("Download rincian (CSV)", shown.to_csv(index=False).encode("utf-8"),
-                                   f"instagram_{category.lower()}_{level}_{S}_{E}.csv", "text/csv",
-                                   key=f"mx_download_detail_v3_{category}")
-            else:
-                st.info("Tidak ada rincian untuk kategori dan periode ini.")
+                st.download_button(
+                    "Download rincian (CSV)", shown.to_csv(index=False).encode("utf-8"),
+                    f"instagram_{category.lower()}_{level}_{ctx.start}_{ctx.end}.csv",
+                    "text/csv", key=f"mx_download_detail_v4_{category}",
+                )
         elif analysis == "Breakdown audiens":
-            breakdowns = {
-                "Umur": ("age",), "Gender": ("gender",), "Umur × Gender": ("age", "gender"),
-                "Device": ("impression_device",), "Negara": ("country",), "Wilayah": ("region",),
-            }
-            b1, b2 = st.columns([1, 1.4], vertical_alignment="bottom")
-            selected_breakdown = b1.selectbox("Kelompok", list(breakdowns), key=f"mx_bd_v3_{category}")
-            metric_label = b2.segmented_control("Metrik", ["Belanja", "Impresi", "Klik"], default="Belanja",
-                                                key=f"mx_bd_metric_v3_{category}", label_visibility="collapsed") or "Belanja"
-            metric = {"Belanja": "spend", "Impresi": "impressions", "Klik": "clicks"}[metric_label]
-            dims = breakdowns[selected_breakdown]
-            bd_raw = safe_run(load_insights, ctx.client, ctx.account, ctx.version, "campaign", str(S), str(E),
-                              breakdowns=dims)
-            bd = tag_campaigns(bd_raw) if bd_raw is not None and not bd_raw.empty else pd.DataFrame()
-            bd = category_frame(bd, category) if not bd.empty else bd
-            if not bd.empty and all(dim in bd.columns for dim in dims):
-                grouped = bd.groupby(list(dims), dropna=False, as_index=False)[metric].sum()
-                if len(dims) == 2:
-                    st.bar_chart(grouped, x=dims[0], y=metric, color=dims[1])
-                else:
-                    st.bar_chart(grouped.set_index(dims[0])[metric], horizontal=True)
-                st.dataframe(grouped.rename(columns={metric: metric_label}), hide_index=True, width="stretch")
-            else:
-                st.info("Tidak ada data breakdown untuk kombinasi ini.")
-        else:
-            actions = action_rows(campaigns)
-            if actions.empty:
-                st.info("Meta belum mengembalikan hasil/action untuk kategori dan periode ini.")
-            else:
-                action_summary = actions.groupby("action_type", as_index=False)["hasil"].sum().sort_values("hasil", ascending=False)
-                action_summary = action_summary.rename(columns={"action_type": "Jenis hasil", "hasil": "Jumlah"})
-                st.bar_chart(action_summary.head(10).set_index("Jenis hasil")["Jumlah"], horizontal=True)
-                st.dataframe(actions.sort_values("hasil", ascending=False).rename(
-                    columns={"campaign_name": "Campaign", "action_type": "Jenis hasil", "hasil": "Jumlah", "spend": "Belanja"}
-                ), hide_index=True, width="stretch")
-
-    other_count = 0 if raw_campaigns is None or raw_campaigns.empty else int((raw_campaigns["dashboard_category"] == "Lainnya").sum())
-    if other_count:
-        with st.expander(f"Campaign lain yang belum terkategori ({other_count})", expanded=False):
-            st.caption("Campaign ini tidak dimasukkan ke headline Traffic atau Leads.")
-            cols = [c for c in ("campaign_name", "spend", "impressions") if c in raw_campaigns.columns]
-            st.dataframe(raw_campaigns.loc[raw_campaigns["dashboard_category"] == "Lainnya", cols].rename(
-                columns={"campaign_name": "Campaign", "spend": "Belanja", "impressions": "Impresi"}
-            ), hide_index=True, width="stretch")
-
-
-# ---------------- Cek Data & Admin ----------------
-def render_data_check(ctx: Ctx):
-    """Pemeriksaan token, akun iklan, dan integritas Insights (tanpa data Facebook Pages)."""
-    S, E = ctx.start, ctx.end
-    st.markdown('<div class="section-title">Status koneksi dan kualitas data</div>', unsafe_allow_html=True)
-    st.caption("Memeriksa access token, akses akun iklan, dan konsistensi data Insights Instagram Ads.")
-    health_key = (S, E, ctx.account)
-    if st.button("Periksa ulang", key="mx_run_health_check_v3") or st.session_state.get("mx_health_key_v3") != health_key:
-        with st.spinner("Memeriksa koneksi dan data iklan..."):
-            checks, hctx = run_health_checks(
-                ctx.client, ctx.account, S, E, None, include_business_pages=False
+            breakdown = st.selectbox(
+                "Breakdown", ["age", "gender", "country", "region", "publisher_platform"],
+                key=f"mx_breakdown_v4_{category}"
             )
-        st.session_state.mx_health_v3 = dict(checks=checks, ctx=hctx, rng=(S, E), at=datetime.now())
-        st.session_state.mx_health_key_v3 = health_key
-    H = st.session_state.get("mx_health_v3", {"checks": [], "ctx": {}, "rng": (S, E), "at": datetime.now()})
-    counts = Counter(check.status for check in H["checks"])
-    if counts["fail"]:
-        st.error(f"Ada {counts['fail']} hal yang perlu diperiksa.")
-    elif counts["warn"]:
-        st.warning(f"Ada {counts['warn']} peringatan untuk ditinjau.")
-    else:
-        st.success("Pemeriksaan selesai. Tidak ada kegagalan yang terdeteksi.")
-    headline_cards([
-        ("Lolos", idn(counts["pass"]), "Pengecekan berhasil", "#2D9C9A"),
-        ("Peringatan", idn(counts["warn"]), "Perlu ditinjau", "#E2A13A"),
-        ("Gagal", idn(counts["fail"]), "Perlu tindakan", "#D91A7D"),
-        ("Info", idn(counts["info"]), "Informasi tambahan", "#4A7CD9"),
-    ])
-    st.caption(f"Terakhir diperiksa {H['at']:%H:%M:%S} · {H['rng'][0]} – {H['rng'][1]}")
-    with st.expander("Detail pemeriksaan", expanded=False):
-        st.dataframe(pd.DataFrame([{
-            "Status": check.status.upper(), "Bagian": check.group,
-            "Pemeriksaan": check.name, "Keterangan": check.detail,
-        } for check in H["checks"]]), hide_index=True, width="stretch")
-    daily = H["ctx"].get("daily")
-    if daily is not None and not daily.empty:
-        with st.expander("Total data dari akun iklan", expanded=False):
-            cols = st.columns(3)
-            cols[0].metric("Belanja", money(daily["spend"].sum()))
-            cols[1].metric("Impresi", idn(daily["impressions"].sum()))
-            cols[2].metric("Klik", idn(daily["clicks"].sum()))
-            st.dataframe(daily.sort_values("date_start", ascending=False).head(15),
-                         hide_index=True, width="stretch")
+            detail = safe_run(
+                load_insights, ctx.client, ctx.account, ctx.version, "campaign",
+                str(ctx.start), str(ctx.end), breakdowns=(breakdown,)
+            )
+            if detail is not None and not detail.empty:
+                detail = tag_campaigns(detail)
+                detail = category_frame(detail, category)
+                keep = [c for c in (breakdown, "spend", FOLLOW_FIELD) if c in detail.columns]
+                st.dataframe(detail[keep].sort_values("spend", ascending=False),
+                             hide_index=True, width="stretch")
+        else:
+            totals = action_totals(campaigns)
+            if totals.empty:
+                st.info("Meta tidak mengembalikan data actions pada periode ini.")
+            else:
+                st.dataframe(
+                    totals.rename_axis("Action").reset_index(name="Jumlah"),
+                    hide_index=True, width="stretch"
+                )
 
 
 def render_admin(ctx: Ctx):
