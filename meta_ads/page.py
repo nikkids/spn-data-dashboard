@@ -607,7 +607,6 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         st.caption("Meta belum mengembalikan action Leads untuk campaign pada periode ini; Total Join Community tetap dihitung dari email unik SPN.")
 
     with st.container(border=True):
-        st.markdown('<div class="section-title">Follower baru Instagram per hari</div>', unsafe_allow_html=True)
         if follower_trend.empty:
             st.info(follower_error or "Data follower tidak tersedia untuk periode ini.")
         else:
@@ -617,9 +616,7 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
             # Biarkan tanggal tanpa respons sebagai kosong, bukan angka 0 palsu.
             plot = follower_trend.reindex(full_index)
             plot.index.name = "Tanggal"
-            st.caption(
-                "Grafik menunjukkan jumlah follower baru per hari. Data yang tidak tersedia tidak ditampilkan."
-            )
+
             st.line_chart(plot[["Follower baru"]], height=280)
             with st.expander("Rincian follower baru harian", expanded=False):
                 detail = plot.rename_axis("Tanggal").reset_index()
