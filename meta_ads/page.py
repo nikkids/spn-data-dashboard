@@ -445,12 +445,18 @@ def _ad_follow_count(frame: pd.DataFrame) -> float:
 def _instagram_profile_and_trend(ctx: Ctx):
     """Ambil jumlah follower aktual dan net follows/unfollows harian dari Instagram Insights."""
     ig_user_id = cfg("IG_USER_ID", cfg("INSTAGRAM_USER_ID", ""))
+    ig_token = cfg("IG_ACCESS_TOKEN", "")
     if not ig_user_id:
         return None, pd.DataFrame(), "Isi IG_USER_ID pada Streamlit Secrets untuk menghubungkan akun Instagram."
+    if not ig_token:
+        return None, pd.DataFrame(), "Isi IG_ACCESS_TOKEN pada Streamlit Secrets. Token Instagram dipisahkan dari META_TOKEN."
 
+    # Instagram Graph API harus memakai token yang memiliki instagram_basic
+    # dan instagram_manage_insights; ctx.client sendiri memakai META_TOKEN
+    # untuk permintaan Marketing API / Ads Insights.
     profile = safe_run(
         graph, ctx.client, ctx.version, str(ig_user_id),
-        (("fields", "username,followers_count"),), False
+        (("fields", "username,followers_count"),), False, token=str(ig_token)
     )
     follower_total = None if not profile else profile.get("followers_count")
 
@@ -459,7 +465,7 @@ def _instagram_profile_and_trend(ctx: Ctx):
         (("metric", "follows_and_unfollows"),
          ("period", "day"),
          ("since", str(ctx.start)),
-         ("until", str(ctx.end))), False
+         ("until", str(ctx.end))), False, token=str(ig_token)
     )
     rows = []
     if isinstance(raw, dict):
