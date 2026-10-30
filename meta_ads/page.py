@@ -153,6 +153,7 @@ def clear_meta_cache():
     for fn in (load_insights, load_campaigns, graph, _spn_registrations):
         fn.clear()
     st.session_state.pop("mx_full_report_files", None)
+    st.session_state.pop("mx_full_report_files", None)
 
 
 def safe_run(fn, *args, **kwargs):
@@ -470,27 +471,32 @@ def _instagram_profile_and_trend(ctx: Ctx):
     )
     follower_total = None if not profile else profile.get("followers_count")
 
-    # Instagram only exposes follower_count for the most recent 30 completed days.
-    # Avoid requesting older ranges: the API returns (#100), which should not
-    # interrupt otherwise-valid Ads KPIs and campaign reporting.
-    first_supported_day = date.today() - timedelta(days=30)
-    if ctx.start < first_supported_day:
+    # Instagram Insights only supports follower_count in a rolling recent window,
+    # excluding the current day. Calculate the supported overlap on every run so
+    # the limit moves forward automatically; use Jakarta's calendar date.
+    today_jakarta = pd.Timestamp.now(tz="Asia/Jakarta").date()
+    first_supported_day = today_jakarta - timedelta(days=30)
+    last_supported_day = today_jakarta - timedelta(days=1)
+    query_start = max(ctx.start, first_supported_day)
+    query_end = min(ctx.end, last_supported_day)
+
+    if query_start > query_end:
         return (
             follower_total,
             pd.DataFrame(),
-            "Grafik follower harian tidak tersedia untuk seluruh periode ini. "
-            f"Instagram Insights hanya menyediakan follower_count dalam 30 hari terakhir "
-            f"(mulai {first_supported_day:%d %b %Y}, tidak termasuk hari ini). "
-            "Pilih rentang yang lebih baru. Data Ads dan KPI lainnya tetap ditampilkan.",
+            "Data follower tidak tersedia untuk periode yang dipilih. "
+            "Instagram Insights hanya menyediakan data historis terbaru. "
+            "Data Ads dan KPI lainnya tetap ditampilkan.",
         )
 
+    partial_window = query_start != ctx.start or query_end != ctx.end
     raw = safe_run(
         graph, ig_client, ig_version, f"{ig_user_id}/insights",
         (("metric", "follower_count"),
          ("metric_type", "time_series"),
          ("period", "day"),
-         ("since", str(ctx.start)),
-         ("until", str(ctx.end))), False, token=str(ig_token)
+         ("since", str(query_start)),
+         ("until", str(query_end))), False, token=str(ig_token)
     )
 
     rows = []
@@ -515,7 +521,11 @@ def _instagram_profile_and_trend(ctx: Ctx):
     if not trend.empty:
         trend = trend.dropna(subset=["Tanggal"]).set_index("Tanggal").sort_index()
         trend = trend[~trend.index.duplicated(keep="last")]
-    return follower_total, trend, None
+    note = (
+        "Grafik follower hanya menampilkan tanggal yang masih tersedia dari Instagram Insights."
+        if partial_window and not trend.empty else None
+    )
+    return follower_total, trend, note
 
 
 def render_stats(ctx: Ctx, category, raw_campaigns):
@@ -598,21 +608,17 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
 
     with st.container(border=True):
         st.markdown('<div class="section-title">Follower baru Instagram per hari</div>', unsafe_allow_html=True)
-        if follower_error:
-            st.info(follower_error)
-        elif follower_trend.empty:
-            st.info(
-                "Meta tidak mengembalikan data follower_count harian untuk periode ini. "
-                "Periksa apakah Insights tersedia untuk akun Professional dan rentang tanggal tersebut."
-            )
+        if follower_trend.empty:
+            st.info(follower_error or "Data follower tidak tersedia untuk periode ini.")
         else:
+            if follower_error:
+                st.caption(follower_error)
             full_index = pd.date_range(pd.Timestamp(ctx.start), pd.Timestamp(ctx.end), freq="D")
             # Biarkan tanggal tanpa respons sebagai kosong, bukan angka 0 palsu.
             plot = follower_trend.reindex(full_index)
             plot.index.name = "Tanggal"
             st.caption(
-                "Grafik menunjukkan jumlah follower baru per hari dari metric follower_count. "
-                "Ini bukan net growth karena data unfollows harian tidak tersedia pada respons yang diuji."
+                "Grafik menunjukkan jumlah follower baru per hari. Data yang tidak tersedia tidak ditampilkan."
             )
             st.line_chart(plot[["Follower baru"]], height=280)
             with st.expander("Rincian follower baru harian", expanded=False):
@@ -650,12 +656,6 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
             "Result pada tabel adalah kunjungan profil Instagram yang dilaporkan Meta."
         )
         st.dataframe(table, hide_index=True, width="stretch")
-        st.download_button(
-            "Download data campaign (CSV)",
-            display_raw.to_csv(index=False).encode("utf-8"),
-            f"instagram_{category.lower()}_campaign_{ctx.start}_{ctx.end}.csv",
-            "text/csv", key=f"mx_download_top_v4_{category}",
-        )
 
     with st.expander("Analisis lanjutan", expanded=False):
         analysis = st.radio(
@@ -690,11 +690,6 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
                 if "Follower By Ads" in shown:
                     shown["Follower By Ads"] = shown["Follower By Ads"].map(idn)
                 st.dataframe(shown, hide_index=True, width="stretch")
-                st.download_button(
-                    "Download rincian (CSV)", shown.to_csv(index=False).encode("utf-8"),
-                    f"instagram_{category.lower()}_{level}_{ctx.start}_{ctx.end}.csv",
-                    "text/csv", key=f"mx_download_detail_v4_{category}",
-                )
         elif analysis == "Breakdown audiens":
             breakdown = st.selectbox(
                 "Breakdown", ["age", "gender", "country", "region", "publisher_platform"],
@@ -1251,18 +1246,56 @@ def _pdf_report(payload) -> bytes:
 
 
 def render_export_panel(ctx: Ctx, raw_campaigns):
-    """Tombol unduh report lengkap pada periode/filter yang sedang aktif."""
-    with st.expander("Export laporan lengkap", expanded=False):
-        st.caption("Laporan mencakup KPI Traffic & Leads, funnel community, seluruh campaign, dan tren harian yang tersedia.")
-        period_key = (str(ctx.start), str(ctx.end))
-        cached = st.session_state.get("mx_full_report_files")
-        if cached and cached.get("period") != period_key:
-            st.session_state.pop("mx_full_report_files", None)
-            cached = None
+    """Visible export panel with recognizable PDF and Excel file badges."""
+    period_key = (str(ctx.start), str(ctx.end))
+    cached = st.session_state.get("mx_full_report_files")
+    if cached and cached.get("period") != period_key:
+        st.session_state.pop("mx_full_report_files", None)
+        cached = None
 
-        if st.button("Siapkan laporan PDF dan Excel", key="mx_prepare_full_report", width="stretch"):
+    st.markdown("""
+    <style>
+      .mx-export-format {
+        display:flex; align-items:center; gap:.8rem; min-height:66px;
+        padding:.72rem .8rem; border:1px solid var(--line,#DCE4F5);
+        border-radius:12px; background:var(--panel,#F7F8FC); margin:.15rem 0 .55rem;
+      }
+      .mx-export-filemark {
+        width:48px; height:52px; flex:0 0 48px; border-radius:9px;
+        display:flex; align-items:center; justify-content:center;
+        font-weight:850; font-size:.78rem; letter-spacing:-.02em;
+        box-shadow:inset 0 0 0 1px rgba(0,0,0,.04);
+      }
+      .mx-export-filemark--pdf { color:#B42318; background:#FDE8E7; }
+      .mx-export-filemark--xlsx { color:#167344; background:#E3F4EA; }
+      .mx-export-filemark svg { width:27px; height:29px; display:block; margin:auto auto 1px; }
+      .mx-export-filemark span { display:block; text-align:center; font-size:.62rem; line-height:1; }
+      .mx-export-filemark-inner { display:flex; flex-direction:column; align-items:center; gap:1px; }
+      .mx-export-format-title { color:var(--text-color,#20243A); font-weight:700; font-size:.9rem; line-height:1.25; }
+      .mx-export-format-note { color:var(--muted,#65708A); font-size:.73rem; line-height:1.35; margin-top:.16rem; }
+      @media (max-width:600px) {
+        .mx-export-format { min-height:60px; padding:.6rem; gap:.6rem; }
+        .mx-export-filemark { width:42px; height:46px; flex-basis:42px; }
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
+    with st.container(border=True):
+        top, period_col = st.columns([2.5, 1.2], vertical_alignment="center")
+        with top:
+            st.markdown("**Export laporan**")
+            st.caption("Unduh laporan performa Instagram Ads, funnel community, campaign, dan tren harian.")
+        with period_col:
+            st.caption("PERIODE LAPORAN")
+            st.markdown(f"**{ctx.start:%d %b %Y} – {ctx.end:%d %b %Y}**")
+
+        prepare = st.button(
+            "Siapkan laporan", type="primary", icon=":material/description:",
+            key="mx_prepare_full_report", width="stretch",
+        )
+        if prepare:
             try:
-                with st.spinner("Menyusun laporan lengkap..."):
+                with st.spinner("Menyusun laporan PDF dan Excel..."):
                     payload = _report_payload(ctx, raw_campaigns)
                     xlsx_bytes = _excel_report(payload)
                     pdf_bytes = _pdf_report(payload)
@@ -1270,7 +1303,6 @@ def render_export_panel(ctx: Ctx, raw_campaigns):
                         "period": period_key, "xlsx": xlsx_bytes, "pdf": pdf_bytes,
                     }
                 cached = st.session_state["mx_full_report_files"]
-                st.success("Laporan berhasil disiapkan. Pilih format untuk mengunduh.")
             except ImportError:
                 st.error("Library export belum terpasang. Tambahkan reportlab dan XlsxWriter ke requirements.txt lalu deploy ulang.")
                 return
@@ -1278,22 +1310,61 @@ def render_export_panel(ctx: Ctx, raw_campaigns):
                 st.error(f"Laporan belum dapat dibuat: {exc}")
                 return
 
-        if cached and cached.get("period") == period_key:
-            base = f"SPN_Instagram_Ads_Report_{ctx.start:%Y%m%d}_{ctx.end:%Y%m%d}"
-            col_xlsx, col_pdf = st.columns(2)
-            with col_xlsx:
-                st.download_button(
-                    "Download Excel (.xlsx)", cached["xlsx"],
-                    file_name=f"{base}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch", key="mx_full_report_xlsx",
-                )
-            with col_pdf:
-                st.download_button(
-                    "Download PDF (.pdf)", cached["pdf"],
-                    file_name=f"{base}.pdf", mime="application/pdf",
-                    width="stretch", key="mx_full_report_pdf",
-                )
+        cached = st.session_state.get("mx_full_report_files")
+        is_ready = bool(cached and cached.get("period") == period_key)
+        base = f"SPN_Instagram_Ads_Report_{ctx.start:%Y%m%d}_{ctx.end:%Y%m%d}"
+        pdf_col, excel_col = st.columns(2, gap="medium")
+        with pdf_col:
+            st.markdown("""
+            <div class="mx-export-format">
+              <div class="mx-export-filemark mx-export-filemark--pdf">
+                <div class="mx-export-filemark-inner">
+                  <svg viewBox="0 0 32 34" aria-hidden="true">
+                    <path d="M7 1.8h12l7 7v22.4H7z" fill="currentColor" opacity=".18"/>
+                    <path d="M19 1.8v7h7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                    <path d="M10 18.5h13M10 22h13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                  </svg>
+                  <span>PDF</span>
+                </div>
+              </div>
+              <div><div class="mx-export-format-title">PDF Report</div>
+                <div class="mx-export-format-note">Dokumen siap dibagikan dan dicetak</div></div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.download_button(
+                "Download PDF", cached["pdf"] if is_ready else b"",
+                file_name=f"{base}.pdf", mime="application/pdf",
+                width="stretch", disabled=not is_ready, key="mx_full_report_pdf",
+                icon=":material/download:",
+            )
+        with excel_col:
+            st.markdown("""
+            <div class="mx-export-format">
+              <div class="mx-export-filemark mx-export-filemark--xlsx">
+                <div class="mx-export-filemark-inner">
+                  <svg viewBox="0 0 32 34" aria-hidden="true">
+                    <path d="M7 1.8h12l7 7v22.4H7z" fill="currentColor" opacity=".18"/>
+                    <path d="M19 1.8v7h7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                    <path d="m10 17 5 7m0-7-5 7m7-3.5h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  </svg>
+                  <span>XLSX</span>
+                </div>
+              </div>
+              <div><div class="mx-export-format-title">Excel Workbook</div>
+                <div class="mx-export-format-note">Data lengkap dalam beberapa sheet</div></div>
+            </div>
+            """, unsafe_allow_html=True)
+            st.download_button(
+                "Download Excel", cached["xlsx"] if is_ready else b"",
+                file_name=f"{base}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch", disabled=not is_ready, key="mx_full_report_xlsx",
+                icon=":material/download:",
+            )
+        if is_ready:
+            st.caption("Laporan siap diunduh. Jika periode diubah, siapkan laporan kembali.")
+        else:
+            st.caption("Klik **Siapkan laporan** satu kali, lalu pilih format unduhan.")
 
 # ---------------- titik masuk ----------------
 META_CSS = """
