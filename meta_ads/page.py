@@ -8,11 +8,13 @@ yang dipanggil dari menu "Meta Ads" di app-publish.py. Perbedaan dengan app asli
   * laporan hanya menampilkan metrik iklan dan tidak mengambil data Facebook Pages
   * semua key session_state diawali "mx_" supaya tidak bentrok dengan filter dashboard SPN
   * tombol Refresh hanya menghapus cache milik Meta Ads, bukan seluruh cache aplikasi
+  * laporan lengkap dapat diunduh sebagai workbook Excel dan PDF terformat
   * kalau secrets belum diisi, hanya halaman ini yang menampilkan pesan error
 """
 from __future__ import annotations
 
 import hmac
+from io import BytesIO
 import html as html_lib
 import os
 import re
@@ -150,6 +152,7 @@ def clear_meta_cache():
     """Hapus cache Meta Ads saja. Jangan pakai st.cache_data.clear(): itu ikut menghapus cache data SPN."""
     for fn in (load_insights, load_campaigns, graph, _spn_registrations):
         fn.clear()
+    st.session_state.pop("mx_full_report_files", None)
 
 
 def safe_run(fn, *args, **kwargs):
@@ -467,6 +470,20 @@ def _instagram_profile_and_trend(ctx: Ctx):
     )
     follower_total = None if not profile else profile.get("followers_count")
 
+    # Instagram only exposes follower_count for the most recent 30 completed days.
+    # Avoid requesting older ranges: the API returns (#100), which should not
+    # interrupt otherwise-valid Ads KPIs and campaign reporting.
+    first_supported_day = date.today() - timedelta(days=30)
+    if ctx.start < first_supported_day:
+        return (
+            follower_total,
+            pd.DataFrame(),
+            "Grafik follower harian tidak tersedia untuk seluruh periode ini. "
+            f"Instagram Insights hanya menyediakan follower_count dalam 30 hari terakhir "
+            f"(mulai {first_supported_day:%d %b %Y}, tidak termasuk hari ini). "
+            "Pilih rentang yang lebih baru. Data Ads dan KPI lainnya tetap ditampilkan.",
+        )
+
     raw = safe_run(
         graph, ig_client, ig_version, f"{ig_user_id}/insights",
         (("metric", "follower_count"),
@@ -573,11 +590,6 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         funnel_cols[1].metric("Total Join Community", idn(registrations) if registrations is not None else "-")
         funnel_cols[2].metric("CR", f"{idn(conversion_rate, 2)}%" if conversion_rate is not None else "-")
         funnel_cols[3].metric("CAC", rp(cac))
-        st.caption(
-            "CR = email member unik ÷ Profile Visits × 100%. "
-            "CAC = total belanja campaign Traffic + Leads ÷ member baru. "
-            "CR ini rasio agregat periode, bukan atribusi per orang."
-        )
         if registrations is None:
             st.warning("Data pendaftar belum terbaca. Pastikan file CSV tersedia dan memiliki kolom timestamp serta email.")
 
@@ -789,6 +801,500 @@ def _password_ok() -> bool:
     return False
 
 
+# ---------------- laporan lengkap: Excel dan PDF ----------------
+def _report_number(value):
+    try:
+        return float(value) if value is not None and pd.notna(value) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _report_payload(ctx: Ctx, raw_campaigns):
+    """Siapkan satu paket data lengkap agar export konsisten dengan filter aktif."""
+    raw = tag_campaigns(raw_campaigns) if raw_campaigns is not None and not raw_campaigns.empty else pd.DataFrame()
+    traffic = category_frame(raw, "Traffic") if not raw.empty else pd.DataFrame()
+    leads = category_frame(raw, "Leads") if not raw.empty else pd.DataFrame()
+    traffic = prepare_results(traffic) if not traffic.empty else traffic
+    leads = prepare_results(leads) if not leads.empty else leads
+
+    traffic_spend = _series_sum(traffic, "spend")
+    leads_spend = _series_sum(leads, "spend")
+    traffic_visits = _series_sum(traffic, "profile_visits")
+    registrations = _spn_registrations(
+        str(ctx.start), str(ctx.end), str(cfg("SPN_CSV_PATH", "master_penting_3.csv"))
+    )
+    total_spend = traffic_spend + leads_spend
+    cr = (registrations / traffic_visits * 100) if registrations is not None and traffic_visits > 0 else None
+    cac = (total_spend / registrations) if registrations is not None and registrations > 0 else None
+    traffic_follows = _ad_follow_count(traffic)
+    leads_follows = _ad_follow_count(leads)
+    traffic_cpf = div(traffic_spend, traffic_follows)
+    leads_cpf = div(leads_spend, leads_follows)
+    follower_total, follower_trend, follower_error = _instagram_profile_and_trend(ctx)
+
+    # Lengkapi tabel campaign: seluruh campaign yang berhasil diambil, bukan hanya top 10.
+    prepared = pd.concat([traffic, leads], ignore_index=True) if (not traffic.empty or not leads.empty) else pd.DataFrame()
+    if not prepared.empty:
+        campaign_columns = [
+            ("dashboard_category", "Kategori"), ("campaign_name", "Campaign"),
+            ("spend", "Spend (Rp)"), ("impressions", "Impressions"),
+            ("reach", "Reach"), ("clicks", "Clicks"), ("ctr", "CTR (%)"),
+            ("profile_visits", "Profile Visits"), (FOLLOW_FIELD, "Follower By Ads"),
+            ("frequency", "Frequency"),
+        ]
+        available = [(src, dst) for src, dst in campaign_columns if src in prepared.columns]
+        campaigns_export = prepared[[src for src, _ in available]].rename(columns=dict(available))
+        if "Campaign" in campaigns_export:
+            campaigns_export = campaigns_export.sort_values("Spend (Rp)" if "Spend (Rp)" in campaigns_export else "Campaign", ascending=False)
+    else:
+        campaigns_export = pd.DataFrame(columns=[
+            "Kategori", "Campaign", "Spend (Rp)", "Impressions", "Reach", "Clicks",
+            "CTR (%)", "Profile Visits", "Follower By Ads", "Frequency"
+        ])
+
+    # Daily spend by objective; the query is already cached by load_insights.
+    daily_source = safe_run(
+        load_insights, ctx.client, ctx.account, ctx.version, "campaign",
+        str(ctx.start), str(ctx.end), daily=True
+    )
+    if daily_source is not None and not daily_source.empty and "date_start" in daily_source.columns:
+        daily_source = tag_campaigns(daily_source)
+        daily_source = daily_source[daily_source["dashboard_category"].isin(["Traffic", "Leads"])].copy()
+        daily_source["date_start"] = pd.to_datetime(daily_source["date_start"], errors="coerce").dt.normalize()
+        daily_source = daily_source.dropna(subset=["date_start"])
+        daily_spend = daily_source.pivot_table(
+            index="date_start", columns="dashboard_category", values="spend", aggfunc="sum"
+        )
+    else:
+        daily_spend = pd.DataFrame()
+    full_index = pd.date_range(pd.Timestamp(ctx.start), pd.Timestamp(ctx.end), freq="D")
+    daily_spend = daily_spend.reindex(full_index, fill_value=0).fillna(0)
+    for col in ("Traffic", "Leads"):
+        if col not in daily_spend.columns:
+            daily_spend[col] = 0.0
+    daily_spend = daily_spend[["Traffic", "Leads"]]
+    daily_spend.index.name = "Tanggal"
+
+    daily_report = daily_spend.reset_index()
+    if not follower_trend.empty:
+        daily_report = daily_report.merge(
+            follower_trend.reset_index()[["Tanggal", "Follower baru"]], on="Tanggal", how="left"
+        )
+    else:
+        daily_report["Follower baru"] = pd.NA
+
+    metrics = pd.DataFrame([
+        {"Metrik": "Total Spend (Rp)", "Traffic": traffic_spend, "Leads": leads_spend, "Total / Global": total_spend},
+        {"Metrik": "Result", "Traffic": traffic_visits, "Leads": registrations, "Total / Global": None},
+        {"Metrik": "Cost per Result (Rp)", "Traffic": div(traffic_spend, traffic_visits), "Leads": cac, "Total / Global": None},
+        {"Metrik": "Follower By Ads", "Traffic": traffic_follows, "Leads": leads_follows, "Total / Global": traffic_follows + leads_follows},
+        {"Metrik": "CPF (Rp)", "Traffic": traffic_cpf, "Leads": leads_cpf, "Total / Global": None},
+        {"Metrik": "Follower Asli IG", "Traffic": None, "Leads": None, "Total / Global": follower_total},
+        {"Metrik": "Impressions", "Traffic": _series_sum(traffic, "impressions"), "Leads": _series_sum(leads, "impressions"), "Total / Global": _series_sum(traffic, "impressions") + _series_sum(leads, "impressions")},
+        {"Metrik": "Reach (akumulasi campaign)", "Traffic": _series_sum(traffic, "reach"), "Leads": _series_sum(leads, "reach"), "Total / Global": _series_sum(traffic, "reach") + _series_sum(leads, "reach")},
+    ])
+    funnel = pd.DataFrame([
+        {"Metrik": "Profile Visits (Traffic)", "Nilai": traffic_visits},
+        {"Metrik": "Total Join Community (email unik)", "Nilai": registrations},
+        {"Metrik": "CR (%)", "Nilai": cr},
+        {"Metrik": "CAC (Rp / member baru)", "Nilai": cac},
+    ])
+    objective = pd.DataFrame([
+        {"Objective": "Traffic", "Campaign": _campaign_count(traffic), "Spend (Rp)": traffic_spend,
+         "Result": traffic_visits, "Cost per Result (Rp)": div(traffic_spend, traffic_visits),
+         "Follower By Ads": traffic_follows, "CPF (Rp)": traffic_cpf,
+         "Impressions": _series_sum(traffic, "impressions"), "Reach": _series_sum(traffic, "reach")},
+        {"Objective": "Leads", "Campaign": _campaign_count(leads), "Spend (Rp)": leads_spend,
+         "Result": registrations, "Cost per Result (Rp)": cac,
+         "Follower By Ads": leads_follows, "CPF (Rp)": leads_cpf,
+         "Impressions": _series_sum(leads, "impressions"), "Reach": _series_sum(leads, "reach")},
+    ])
+    return {
+        "start": ctx.start, "end": ctx.end, "metrics": metrics, "funnel": funnel,
+        "objective": objective, "campaigns": campaigns_export,
+        "daily": daily_report, "follower_error": follower_error,
+        "follower_total": follower_total,
+    }
+
+
+def _excel_report(payload) -> bytes:
+    """Workbook terformat: executive summary, funnel, campaign detail, dan tren harian."""
+    import xlsxwriter  # noqa: F401 - memastikan engine tersedia di deployment
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd mmm yyyy") as writer:
+        payload["metrics"].to_excel(writer, sheet_name="KPI Summary", index=False, startrow=4)
+        payload["objective"].to_excel(writer, sheet_name="KPI Summary", index=False, startrow=17)
+        payload["funnel"].to_excel(writer, sheet_name="Community Funnel", index=False, startrow=4)
+        payload["campaigns"].to_excel(writer, sheet_name="Campaign Detail", index=False, startrow=4)
+        payload["daily"].to_excel(writer, sheet_name="Daily Trend", index=False, startrow=4)
+
+        workbook = writer.book
+        navy = "1A1464"
+        blue = "497CD6"
+        pale = "EAF1FF"
+        muted = "65718F"
+        title_fmt = workbook.add_format({"bold": True, "font_size": 18, "font_color": navy})
+        subtitle_fmt = workbook.add_format({"font_size": 10, "font_color": muted})
+        section_fmt = workbook.add_format({"bold": True, "font_size": 11, "font_color": navy, "bottom": 2, "bottom_color": blue})
+        header_fmt = workbook.add_format({"bold": True, "font_color": "FFFFFF", "bg_color": navy, "text_wrap": True, "valign": "vcenter", "border": 0})
+        money_fmt = workbook.add_format({"num_format": '"Rp" #,##0;[Red]("Rp" #,##0);-'})
+        number_fmt = workbook.add_format({"num_format": "#,##0;[Red](#,##0);-"})
+        percent_fmt = workbook.add_format({"num_format": '0.00"%"'})
+        date_fmt = workbook.add_format({"num_format": "dd mmm yyyy"})
+        text_fmt = workbook.add_format({"font_color": "24304F"})
+        note_fmt = workbook.add_format({"font_color": muted, "italic": True, "text_wrap": True, "valign": "top"})
+        sheet_widths = {
+            "KPI Summary": 9,
+            "Community Funnel": max(2, len(payload["funnel"].columns)),
+            "Campaign Detail": max(1, len(payload["campaigns"].columns)),
+            "Daily Trend": max(1, len(payload["daily"].columns)),
+        }
+        for name in writer.sheets:
+            ws = writer.sheets[name]
+            last_col = sheet_widths.get(name, 4) - 1
+            ws.hide_gridlines(2)
+            ws.set_default_row(20)
+            ws.set_tab_color(blue)
+            ws.set_landscape()
+            ws.fit_to_pages(1, 0)
+            ws.set_margins(0.25, 0.25, 0.5, 0.5)
+            ws.freeze_panes(5 if name in ("Campaign Detail", "Daily Trend") else 4, 0)
+            ws.merge_range(0, 0, 0, last_col, "SPN | INSTAGRAM ADS PERFORMANCE REPORT", title_fmt)
+            ws.merge_range(1, 0, 1, min(last_col, 3), f"Periode: {payload['start']:%d %b %Y} – {payload['end']:%d %b %Y}", subtitle_fmt)
+            ws.set_row(0, 30)
+            ws.set_row(2, 22)
+        # KPI Summary: table utama dan per objective.
+        ws = writer.sheets["KPI Summary"]
+        ws.merge_range("A3:D3", "RINGKASAN KPI", section_fmt)
+        for col_idx, col_name in enumerate(payload["metrics"].columns):
+            ws.write(4, col_idx, col_name, header_fmt)
+        ws.set_row(4, 32)
+        ws.set_row(15, 22)
+        ws.set_row(16, 8)
+        ws.set_column("A:A", 32, text_fmt)
+        ws.set_column("B:D", 20, number_fmt)
+        ws.set_column("E:I", 20, number_fmt)
+        for row in (4,):
+            for col in (1, 2, 3):
+                ws.set_column(col, col, 20, number_fmt)
+        ws.merge_range("A16:I16", "PERFORMA PER OBJECTIVE", section_fmt)
+        for col_idx, col_name in enumerate(payload["objective"].columns):
+            ws.write(17, col_idx, col_name, header_fmt)
+        ws.set_row(17, 32)
+        # Format sel tabel objective per baris agar format kolom Leads di KPI utama
+        # tidak ikut berubah menjadi format mata uang.
+        objective_money_fields = {"Spend (Rp)", "Cost per Result (Rp)", "CPF (Rp)"}
+        for row_idx, row_data in payload["objective"].iterrows():
+            for col_idx, col_name in enumerate(payload["objective"].columns):
+                value = row_data[col_name]
+                if pd.notna(value) and isinstance(value, (int, float)):
+                    cell_fmt = money_fmt if col_name in objective_money_fields else number_fmt
+                    ws.write_number(18 + row_idx, col_idx, float(value), cell_fmt)
+        # Format kolom uang khusus pada KPI utama.
+        for row in [5, 7, 9]:
+            for col in [1, 2, 3]:
+                metric_idx = row - 5
+                if col < len(payload["metrics"].columns) and pd.notna(payload["metrics"].iloc[metric_idx, col]):
+                    ws.write_number(row, col, float(payload["metrics"].iloc[metric_idx, col]), money_fmt)
+        # Funnel
+        ws = writer.sheets["Community Funnel"]
+        ws.merge_range("A3:B3", "COMMUNITY CONVERSION", section_fmt)
+        for col_idx, col_name in enumerate(payload["funnel"].columns):
+            ws.write(4, col_idx, col_name, header_fmt)
+        ws.set_row(4, 32)
+        ws.set_column("A:A", 42, text_fmt)
+        ws.set_column("B:B", 24, number_fmt)
+        for idx, row in payload["funnel"].iterrows():
+            value = row["Nilai"]
+            if pd.notna(value):
+                fmt = money_fmt if "CAC" in row["Metrik"] else (percent_fmt if "CR" in row["Metrik"] else number_fmt)
+                ws.write_number(5 + idx, 1, float(value), fmt)
+        # Campaign detail
+        ws = writer.sheets["Campaign Detail"]
+        ws.merge_range(
+            3, 0, 3, max(0, len(payload["campaigns"].columns) - 1),
+            "SELURUH CAMPAIGN DALAM PERIODE", section_fmt
+        )
+        for col_idx, col_name in enumerate(payload["campaigns"].columns):
+            ws.write(4, col_idx, col_name, header_fmt)
+        ws.set_row(4, 34)
+        ws.freeze_panes(5, 2)
+        ws.autofilter(4, 0, 4 + len(payload["campaigns"]), max(0, len(payload["campaigns"].columns) - 1))
+        widths = {"Kategori": 13, "Campaign": 42, "Spend (Rp)": 16, "Impressions": 14, "Reach": 14, "Clicks": 12, "CTR (%)": 12, "Profile Visits": 16, "Follower By Ads": 16, "Frequency": 12}
+        for col_idx, col_name in enumerate(payload["campaigns"].columns):
+            ws.set_column(col_idx, col_idx, widths.get(col_name, 16))
+            if col_name == "Spend (Rp)":
+                ws.set_column(col_idx, col_idx, widths.get(col_name, 16), money_fmt)
+            elif col_name == "CTR (%)":
+                ws.set_column(col_idx, col_idx, widths.get(col_name, 16), percent_fmt)
+            elif col_name != "Campaign" and col_name != "Kategori":
+                ws.set_column(col_idx, col_idx, widths.get(col_name, 16), number_fmt)
+        if len(payload["campaigns"]):
+            ws.conditional_format(5, 2, 4 + len(payload["campaigns"]), 2, {"type": "data_bar", "bar_color": blue})
+        # Daily trend
+        ws = writer.sheets["Daily Trend"]
+        ws.merge_range("A3:D3", "TREN HARIAN", section_fmt)
+        for col_idx, col_name in enumerate(payload["daily"].columns):
+            ws.write(4, col_idx, col_name, header_fmt)
+        ws.set_row(4, 32)
+        ws.set_column("A:A", 18, date_fmt)
+        ws.set_column("B:C", 18, money_fmt)
+        ws.set_column("D:D", 18, number_fmt)
+        ws.autofilter(4, 0, 4 + len(payload["daily"]), max(0, len(payload["daily"].columns) - 1))
+        for row_idx, day_value in enumerate(payload["daily"]["Tanggal"], start=5):
+            if pd.notna(day_value):
+                ws.write_datetime(row_idx, 0, pd.Timestamp(day_value).to_pydatetime(), date_fmt)
+        if len(payload["daily"]):
+            chart = workbook.add_chart({"type": "line"})
+            n = len(payload["daily"])
+            for col, label in [(1, "Traffic"), (2, "Leads")]:
+                chart.add_series({"name": label, "categories": ["Daily Trend", 5, 0, 4 + n, 0], "values": ["Daily Trend", 5, col, 4 + n, col]})
+            chart.set_title({"name": "Daily Ad Spend"})
+            chart.set_legend({"position": "bottom"})
+            chart.set_y_axis({"name": "Spend (Rp)", "num_format": '"Rp" #,##0'})
+            chart.set_size({"width": 700, "height": 300})
+            ws.insert_chart("F4", chart)
+        if payload.get("follower_error"):
+            note_row = 6 + len(payload["daily"])
+            ws.merge_range(note_row, 0, note_row + 1, max(0, len(payload["daily"].columns) - 1),
+                           "Catatan Instagram Insights: " + str(payload["follower_error"]), note_fmt)
+            ws.set_row(note_row, 30)
+            ws.set_row(note_row + 1, 24)
+    return output.getvalue()
+
+
+def _pdf_report(payload) -> bytes:
+    """PDF landscape dengan ringkasan, funnel, tabel campaign, dan tren harian."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, LongTable, Flowable
+
+    navy = colors.HexColor("#1A1464")
+    blue = colors.HexColor("#497CD6")
+    pale = colors.HexColor("#EAF1FF")
+    muted = colors.HexColor("#65718F")
+    ink = colors.HexColor("#24304F")
+
+    class ReportLineChart(Flowable):
+        def __init__(self, series, width=245*mm, height=32*mm, title="Tren harian"):
+            super().__init__()
+            self.series, self.width, self.height, self.title = series, width, height, title
+        def draw(self):
+            c = self.canv
+            c.setFont("Helvetica-Bold", 9)
+            c.setFillColor(navy)
+            c.drawString(0, self.height - 10, self.title)
+            left, bottom, top = 28, 17, self.height - 20
+            right = self.width - 8
+            points = [v for _, vals, _ in self.series for v in vals if v is not None and pd.notna(v)]
+            if not points:
+                c.setFillColor(muted); c.setFont("Helvetica", 8); c.drawString(left, bottom + 15, "Tidak ada data harian.")
+                return
+            ymin, ymax = min(0, min(points)), max(points)
+            if ymax <= ymin: ymax = ymin + 1
+            c.setStrokeColor(colors.HexColor("#D9E1F2")); c.setLineWidth(.5)
+            for i in range(4):
+                y = bottom + (top-bottom)*i/3
+                c.line(left, y, right, y)
+            c.setFont("Helvetica", 6.5); c.setFillColor(muted)
+            c.drawString(0, bottom, f"{ymin:,.0f}")
+            c.drawString(0, top-2, f"{ymax:,.0f}")
+            palette = [blue, colors.HexColor("#D91A7D"), colors.HexColor("#2D9C9A")]
+            chart_dates = next((dates for _, _, dates in self.series if dates), [])
+            if chart_dates:
+                c.setFillColor(muted); c.setFont("Helvetica", 6.5)
+                first = pd.to_datetime(chart_dates[0], errors="coerce")
+                last = pd.to_datetime(chart_dates[-1], errors="coerce")
+                if pd.notna(first) and pd.notna(last):
+                    c.drawRightString(right, self.height - 10, f"{first:%d %b} - {last:%d %b}")
+            for si, (label, values, dates) in enumerate(self.series):
+                valid = [(i, v) for i, v in enumerate(values) if v is not None and pd.notna(v)]
+                if not valid: continue
+                c.setStrokeColor(palette[si % len(palette)]); c.setLineWidth(1.6)
+                prev = None
+                n = max(len(values)-1, 1)
+                for i, v in valid:
+                    x = left + (right-left)*i/n
+                    y = bottom + (top-bottom)*(float(v)-ymin)/(ymax-ymin)
+                    if prev: c.line(prev[0], prev[1], x, y)
+                    c.setFillColor(palette[si % len(palette)]); c.circle(x, y, 1.5, stroke=0, fill=1)
+                    prev = (x, y)
+                c.setFillColor(palette[si % len(palette)]); c.setFont("Helvetica", 7)
+                c.drawString(left + si*55, 2, label)
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=13*mm, leftMargin=13*mm, topMargin=17*mm, bottomMargin=15*mm, title="SPN Instagram Ads Performance Report")
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=19, leading=23, textColor=navy, alignment=TA_LEFT, spaceAfter=4))
+    styles.add(ParagraphStyle(name="ReportSub", parent=styles["Normal"], fontSize=9, textColor=muted, spaceAfter=10))
+    styles.add(ParagraphStyle(name="Section", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11, leading=14, textColor=navy, spaceBefore=8, spaceAfter=6))
+    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=7, leading=9, textColor=ink))
+
+    def fmt_num(v):
+        return "-" if v is None or pd.isna(v) else f"{float(v):,.0f}".replace(",", ".")
+    def fmt_rp(v):
+        return "-" if v is None or pd.isna(v) else "Rp " + fmt_num(v)
+    def styled_table(data, widths=None, header=True, font=7):
+        t = Table(data, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
+        cmds = [
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING", (0,0), (-1,-1), 5), ("RIGHTPADDING", (0,0), (-1,-1), 5),
+            ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+            ("GRID", (0,0), (-1,-1), .35, colors.HexColor("#DFE6F2")),
+            ("FONTSIZE", (0,0), (-1,-1), font), ("TEXTCOLOR", (0,0), (-1,-1), ink),
+        ]
+        if header:
+            cmds += [("BACKGROUND", (0,0), (-1,0), navy), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold")]
+            if len(data) > 1:
+                cmds += [("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, pale])]
+        t.setStyle(TableStyle(cmds))
+        return t
+
+    story = [
+        Paragraph("SPN | INSTAGRAM ADS PERFORMANCE REPORT", styles["ReportTitle"]),
+        Paragraph(f"Periode laporan: {payload['start']:%d %b %Y} – {payload['end']:%d %b %Y}  ·  Dibuat: {datetime.now():%d %b %Y, %H:%M}", styles["ReportSub"]),
+        Paragraph("Ringkasan KPI", styles["Section"]),
+    ]
+    m = payload["metrics"]
+    metric_rows = [["Metrik", "Traffic", "Leads", "Total / Global"]]
+    for _, row in m.iterrows():
+        vals=[]
+        for col in ("Traffic", "Leads", "Total / Global"):
+            v = row[col]
+            vals.append(fmt_rp(v) if "Spend" in row["Metrik"] or "Cost" in row["Metrik"] or "CPF" in row["Metrik"] else fmt_num(v))
+        metric_rows.append([row["Metrik"], *vals])
+    story.append(styled_table(metric_rows, [70*mm, 42*mm, 42*mm, 48*mm], font=7.5))
+
+    story.append(Paragraph("Konversi ke Community", styles["Section"]))
+    f = payload["funnel"]
+    frow = [["Profile Visits", "Total Join Community", "CR", "CAC"]]
+    vals = [f.iloc[0]["Nilai"], f.iloc[1]["Nilai"], f.iloc[2]["Nilai"], f.iloc[3]["Nilai"]]
+    frow.append([fmt_num(vals[0]), fmt_num(vals[1]), ("-" if vals[2] is None or pd.isna(vals[2]) else f"{float(vals[2]):,.2f}%"), fmt_rp(vals[3])])
+    story.append(styled_table(frow, [60*mm, 60*mm, 45*mm, 45*mm], font=8))
+
+    story.append(Paragraph("Performa per Objective", styles["Section"]))
+    obj = payload["objective"]
+    obj_rows = [["Objective", "Campaign", "Spend", "Result", "Cost / Result", "Follower By Ads", "CPF", "Impressions", "Reach"]]
+    for _, row in obj.iterrows():
+        obj_rows.append([row["Objective"], fmt_num(row["Campaign"]), fmt_rp(row["Spend (Rp)"]), fmt_num(row["Result"]), fmt_rp(row["Cost per Result (Rp)"]), fmt_num(row["Follower By Ads"]), fmt_rp(row["CPF (Rp)"]), fmt_num(row["Impressions"]), fmt_num(row["Reach"])])
+    story.append(styled_table(obj_rows, [24*mm, 18*mm, 30*mm, 22*mm, 30*mm, 26*mm, 25*mm, 24*mm, 22*mm], font=6.3))
+
+    daily = payload["daily"]
+    if not daily.empty:
+        dates = daily["Tanggal"].tolist()
+        spend_series = [
+            ("Traffic Spend", daily["Traffic"].tolist(), dates),
+            ("Leads Spend", daily["Leads"].tolist(), dates),
+        ]
+        story += [Spacer(1, 4), ReportLineChart(spend_series, title="Daily Ad Spend (Rp)")]
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Detail Campaign", styles["ReportTitle"]))
+    story.append(Paragraph("Seluruh campaign yang dikembalikan oleh Meta pada periode terpilih.", styles["ReportSub"]))
+    campaign_df = payload["campaigns"]
+    ccols = [c for c in ["Kategori", "Campaign", "Spend (Rp)", "Impressions", "Reach", "Clicks", "CTR (%)", "Profile Visits", "Follower By Ads"] if c in campaign_df.columns]
+    cdata = [["Kategori", "Campaign", "Spend", "Impr.", "Reach", "Clicks", "CTR", "Profile Visits", "Follows"]]
+    for _, r in campaign_df[ccols].iterrows():
+        cdata.append([
+            str(r.get("Kategori", "")), Paragraph(html_lib.escape(str(r.get("Campaign", ""))[:120]), styles["Small"]),
+            fmt_rp(r.get("Spend (Rp)")), fmt_num(r.get("Impressions")), fmt_num(r.get("Reach")),
+            fmt_num(r.get("Clicks")), ("-" if pd.isna(r.get("CTR (%)")) else f"{float(r.get('CTR (%)')):,.2f}%"),
+            fmt_num(r.get("Profile Visits")), fmt_num(r.get("Follower By Ads")),
+        ])
+    if len(cdata) == 1:
+        cdata.append(["-", "Tidak ada data campaign", "-", "-", "-", "-", "-", "-", "-"])
+    campaign_table = LongTable(cdata, colWidths=[22*mm, 66*mm, 27*mm, 21*mm, 20*mm, 19*mm, 18*mm, 25*mm, 22*mm], repeatRows=1)
+    campaign_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), navy), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 6.3),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#DFE6F2")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, pale]),
+        ("LEFTPADDING", (0,0), (-1,-1), 4), ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 4), ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story.append(campaign_table)
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Daily Data", styles["Section"]))
+    story.append(Paragraph("Belanja harian berdasarkan objective dan data follower baru dari Instagram Insights jika tersedia.", styles["ReportSub"]))
+    if payload.get("follower_error"):
+        story.append(Paragraph("Catatan Instagram Insights: " + html_lib.escape(str(payload["follower_error"])), styles["Small"]))
+        story.append(Spacer(1, 4))
+    ddata = [["Tanggal", "Traffic Spend", "Leads Spend", "Follower baru"]]
+    for _, row in daily.iterrows():
+        d = row["Tanggal"]
+        ddata.append([d.strftime("%d %b %Y") if pd.notna(d) else "-", fmt_rp(row.get("Traffic")), fmt_rp(row.get("Leads")), fmt_num(row.get("Follower baru"))])
+    if len(ddata) == 1:
+        ddata.append(["-", "-", "-", "-"])
+    story.append(LongTable(ddata, colWidths=[45*mm, 48*mm, 48*mm, 45*mm], repeatRows=1, style=TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), navy), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 7.5),
+        ("GRID", (0,0), (-1,-1), .3, colors.HexColor("#DFE6F2")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, pale]),
+        ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ])))
+
+    def page_decor(canvas, doc_):
+        canvas.saveState()
+        w, h = landscape(A4)
+        canvas.setStrokeColor(blue); canvas.setLineWidth(1.2); canvas.line(13*mm, h-10*mm, w-13*mm, h-10*mm)
+        canvas.setFont("Helvetica", 7); canvas.setFillColor(muted)
+        canvas.drawString(13*mm, 7*mm, "SPN · Internal Performance Report")
+        canvas.drawRightString(w-13*mm, 7*mm, f"Page {doc_.page}")
+        canvas.restoreState()
+    doc.build(story, onFirstPage=page_decor, onLaterPages=page_decor)
+    return buffer.getvalue()
+
+
+def render_export_panel(ctx: Ctx, raw_campaigns):
+    """Tombol unduh report lengkap pada periode/filter yang sedang aktif."""
+    with st.expander("Export laporan lengkap", expanded=False):
+        st.caption("Laporan mencakup KPI Traffic & Leads, funnel community, seluruh campaign, dan tren harian yang tersedia.")
+        period_key = (str(ctx.start), str(ctx.end))
+        cached = st.session_state.get("mx_full_report_files")
+        if cached and cached.get("period") != period_key:
+            st.session_state.pop("mx_full_report_files", None)
+            cached = None
+
+        if st.button("Siapkan laporan PDF dan Excel", key="mx_prepare_full_report", width="stretch"):
+            try:
+                with st.spinner("Menyusun laporan lengkap..."):
+                    payload = _report_payload(ctx, raw_campaigns)
+                    xlsx_bytes = _excel_report(payload)
+                    pdf_bytes = _pdf_report(payload)
+                    st.session_state["mx_full_report_files"] = {
+                        "period": period_key, "xlsx": xlsx_bytes, "pdf": pdf_bytes,
+                    }
+                cached = st.session_state["mx_full_report_files"]
+                st.success("Laporan berhasil disiapkan. Pilih format untuk mengunduh.")
+            except ImportError:
+                st.error("Library export belum terpasang. Tambahkan reportlab dan XlsxWriter ke requirements.txt lalu deploy ulang.")
+                return
+            except Exception as exc:
+                st.error(f"Laporan belum dapat dibuat: {exc}")
+                return
+
+        if cached and cached.get("period") == period_key:
+            base = f"SPN_Instagram_Ads_Report_{ctx.start:%Y%m%d}_{ctx.end:%Y%m%d}"
+            col_xlsx, col_pdf = st.columns(2)
+            with col_xlsx:
+                st.download_button(
+                    "Download Excel (.xlsx)", cached["xlsx"],
+                    file_name=f"{base}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch", key="mx_full_report_xlsx",
+                )
+            with col_pdf:
+                st.download_button(
+                    "Download PDF (.pdf)", cached["pdf"],
+                    file_name=f"{base}.pdf", mime="application/pdf",
+                    width="stretch", key="mx_full_report_pdf",
+                )
+
 # ---------------- titik masuk ----------------
 META_CSS = """
 <style>
@@ -851,6 +1357,7 @@ def render():
         return
 
     raw_campaigns = campaign_data(ctx)
+    render_export_panel(ctx, raw_campaigns)
     if menu == "Ringkasan":
         render_overview(ctx, raw_campaigns)
     elif menu == "Traffic":

@@ -5,3 +5,5 @@ altair
 requests
 xlsxwriter
 plotly
+reportlab>=4.2.0
+XlsxWriter>=3.2.0
