@@ -443,7 +443,12 @@ def _ad_follow_count(frame: pd.DataFrame) -> float:
 
 
 def _instagram_profile_and_trend(ctx: Ctx):
-    """Ambil jumlah follower aktual dan net follows/unfollows harian dari Instagram Insights."""
+    """Ambil follower aktual dan jumlah follower baru harian dari Instagram Insights.
+
+    Meta mengembalikan follows_and_unfollows sebagai total_value, bukan time series
+    harian. Untuk grafik harian, gunakan metric follower_count yang sudah teruji
+    mengembalikan values per hari di Graph API Explorer.
+    """
     ig_user_id = cfg("IG_USER_ID", cfg("INSTAGRAM_USER_ID", ""))
     ig_token = cfg("IG_ACCESS_TOKEN", "")
     if not ig_user_id:
@@ -451,36 +456,44 @@ def _instagram_profile_and_trend(ctx: Ctx):
     if not ig_token:
         return None, pd.DataFrame(), "Isi IG_ACCESS_TOKEN pada Streamlit Secrets. Token Instagram dipisahkan dari META_TOKEN."
 
-    # Instagram Graph API harus memakai token yang memiliki instagram_basic
-    # dan instagram_manage_insights; ctx.client sendiri memakai META_TOKEN
-    # untuk permintaan Marketing API / Ads Insights.
+    # Pisahkan versi Instagram Graph API dari Marketing API agar perubahan versi
+    # Insights tidak memengaruhi request Ads Insights yang memakai META_TOKEN.
+    ig_version = str(cfg("IG_API_VERSION", "v26.0"))
+    ig_client = MetaClient(str(ig_token), ig_version)
+
     profile = safe_run(
-        graph, ctx.client, ctx.version, str(ig_user_id),
+        graph, ig_client, ig_version, str(ig_user_id),
         (("fields", "username,followers_count"),), False, token=str(ig_token)
     )
     follower_total = None if not profile else profile.get("followers_count")
 
     raw = safe_run(
-        graph, ctx.client, ctx.version, f"{ig_user_id}/insights",
-        (("metric", "follows_and_unfollows"),
+        graph, ig_client, ig_version, f"{ig_user_id}/insights",
+        (("metric", "follower_count"),
+         ("metric_type", "time_series"),
          ("period", "day"),
          ("since", str(ctx.start)),
          ("until", str(ctx.end))), False, token=str(ig_token)
     )
+
     rows = []
     if isinstance(raw, dict):
         for metric in raw.get("data", []):
+            if metric.get("name") != "follower_count":
+                continue
             for point in metric.get("values", []):
-                value = point.get("value") or {}
-                if isinstance(value, dict):
-                    follows = float(value.get("follows", 0) or 0)
-                    unfollows = float(value.get("unfollows", 0) or 0)
-                    rows.append({
-                        "Tanggal": pd.to_datetime(point.get("end_time"), errors="coerce").normalize(),
-                        "Follows": follows,
-                        "Unfollows": unfollows,
-                        "Perubahan bersih": follows - unfollows,
-                    })
+                stamp = pd.to_datetime(point.get("end_time"), errors="coerce", utc=True)
+                if pd.isna(stamp):
+                    continue
+                # API mengembalikan end_time ber-offset UTC. Samakan ke tanggal WIB
+                # sebelum membuat index agar tidak bentrok dengan date_range yang naive.
+                local_day = stamp.tz_convert("Asia/Jakarta").tz_localize(None).normalize()
+                try:
+                    followers_added = float(point.get("value", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                rows.append({"Tanggal": local_day, "Follower baru": followers_added})
+
     trend = pd.DataFrame(rows)
     if not trend.empty:
         trend = trend.dropna(subset=["Tanggal"]).set_index("Tanggal").sort_index()
@@ -489,77 +502,113 @@ def _instagram_profile_and_trend(ctx: Ctx):
 
 
 def render_stats(ctx: Ctx, category, raw_campaigns):
-    """Traffic dan Leads memakai susunan KPI yang sama; tren menampilkan perubahan follower IG."""
+    """Traffic dan Leads memakai KPI jelas, funnel SPN, dan tren follower baru harian."""
     campaigns = category_frame(raw_campaigns, category) if raw_campaigns is not None else pd.DataFrame()
     if campaigns.empty:
         st.info(f"Belum ada campaign {category} pada periode ini.")
 
     campaigns = prepare_results(campaigns)
     spend = _series_sum(campaigns, "spend")
+    impressions = _series_sum(campaigns, "impressions")
+    reach = _series_sum(campaigns, "reach")
     ad_follows = _ad_follow_count(campaigns)
     cost_per_follow = div(spend, ad_follows)
+
+    # Angka funnel dihitung lintas campaign Traffic + Leads untuk periode yang sama.
+    traffic_campaigns = category_frame(raw_campaigns, "Traffic") if raw_campaigns is not None else pd.DataFrame()
+    leads_campaigns = category_frame(raw_campaigns, "Leads") if raw_campaigns is not None else pd.DataFrame()
+    traffic_campaigns = prepare_results(traffic_campaigns) if not traffic_campaigns.empty else traffic_campaigns
+    leads_campaigns = prepare_results(leads_campaigns) if not leads_campaigns.empty else leads_campaigns
+    traffic_visits = _series_sum(traffic_campaigns, "profile_visits")
+    total_acquisition_spend = _series_sum(traffic_campaigns, "spend") + _series_sum(leads_campaigns, "spend")
+    csv_path = str(cfg("SPN_CSV_PATH", "master_penting_3.csv"))
+    registrations = _spn_registrations(str(ctx.start), str(ctx.end), csv_path)
+    conversion_rate = (
+        registrations / traffic_visits * 100
+        if registrations is not None and traffic_visits > 0 else None
+    )
+    cac = (
+        total_acquisition_spend / registrations
+        if registrations is not None and registrations > 0 else None
+    )
 
     if category == "Traffic":
         result = _series_sum(campaigns, "profile_visits")
         result_label = "Kunjungan profil"
         cost_per_result = div(spend, result)
+        first_kpi_label = "Profile Visits"
+        cost_kpi_label = "Cost per Profile Visit (CPV)"
+        cost_kpi_note = "Spend Traffic dibagi kunjungan profil"
     else:
         result_action = lead_action_choice(campaigns)
         meta_lead_results = (
             float(primary_action_per_campaign(campaigns, result_action).sum())
             if result_action else 0.0
         )
-        csv_path = str(cfg("SPN_CSV_PATH", "master_penting_3.csv"))
-        registrations = _spn_registrations(str(ctx.start), str(ctx.end), csv_path)
         result = registrations
-        result_label = "Pendaftar SPN unik"
-        cost_per_result = div(spend, registrations or 0) if registrations is not None else None
+        result_label = "Email unik yang bergabung ke SPN"
+        cost_per_result = cac
+        first_kpi_label = "Total Join Community"
+        cost_kpi_label = "CAC"
+        cost_kpi_note = "Total spend Traffic + Leads dibagi member baru"
 
     follower_total, follower_trend, follower_error = _instagram_profile_and_trend(ctx)
 
     headline_cards([
-        ("Result", idn(result) if result is not None else "-", result_label),
-        ("Cost per Result", rp(cost_per_result), "Spend dibagi result pada periode terpilih"),
+        (first_kpi_label, idn(result) if result is not None else "-", result_label),
+        (cost_kpi_label, rp(cost_per_result), cost_kpi_note),
         ("Follower By Ads", idn(ad_follows), "Follow yang dilaporkan Meta dari campaign ini"),
         ("Follower Asli IG", idn(follower_total) if follower_total is not None else "-",
          "Jumlah follower aktual akun Instagram"),
-        ("Cost Per Follow", rp(cost_per_follow), "Spend dibagi Follower By Ads"),
+        ("CPF (Cost per Follow)", rp(cost_per_follow), "Spend kategori ini dibagi Follower By Ads"),
         ("Total Spend", rp(spend), f"{category} · {ctx.start:%d %b %Y} – {ctx.end:%d %b %Y}"),
+        ("Impressions", idn(impressions), "Total tayangan dari campaign kategori ini"),
+        ("Reach", idn(reach), "Akumulasi reach per campaign; bisa ada overlap audiens"),
     ])
 
-    if category == "Leads":
-        if result is None:
-            st.warning(
-                "Data pendaftar SPN belum dapat dibaca. Pastikan master_penting_3.csv tersedia "
-                "atau atur SPN_CSV_PATH pada Secrets."
-            )
-        else:
-            st.caption(
-                f"Cost per Result menggunakan {idn(result)} email unik yang mendaftar ke SPN "
-                f"pada {ctx.start:%d %b %Y}–{ctx.end:%d %b %Y}. "
-                "Hasil Leads dari Meta tidak dianggap sama dengan jumlah pendaftar SPN."
-            )
-            if meta_lead_results <= 0:
-                st.caption("Meta belum mengembalikan action Leads untuk campaign pada periode ini.")
+    with st.container(border=True):
+        st.markdown('<div class="section-title">Konversi ke Community</div>', unsafe_allow_html=True)
+        funnel_cols = st.columns(4)
+        funnel_cols[0].metric("Profile Visits (Traffic)", idn(traffic_visits))
+        funnel_cols[1].metric("Total Join Community", idn(registrations) if registrations is not None else "-")
+        funnel_cols[2].metric("CR", f"{idn(conversion_rate, 2)}%" if conversion_rate is not None else "-")
+        funnel_cols[3].metric("CAC", rp(cac))
+        st.caption(
+            "CR = email member unik ÷ Profile Visits × 100%. "
+            "CAC = total belanja campaign Traffic + Leads ÷ member baru. "
+            "CR ini rasio agregat periode, bukan atribusi per orang."
+        )
+        if registrations is None:
+            st.warning("Data pendaftar belum terbaca. Pastikan file CSV tersedia dan memiliki kolom timestamp serta email.")
+
+    if category == "Leads" and registrations is not None and meta_lead_results <= 0:
+        st.caption("Meta belum mengembalikan action Leads untuk campaign pada periode ini; Total Join Community tetap dihitung dari email unik SPN.")
 
     with st.container(border=True):
-        st.markdown('<div class="section-title">Tren follower Instagram</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Follower baru Instagram per hari</div>', unsafe_allow_html=True)
         if follower_error:
             st.info(follower_error)
         elif follower_trend.empty:
             st.info(
-                "Data kenaikan/penurunan follower belum tersedia. Periksa izin Instagram Insights "
-                "dan pastikan IG_USER_ID mengarah ke Instagram Professional Account."
+                "Meta tidak mengembalikan data follower_count harian untuk periode ini. "
+                "Periksa apakah Insights tersedia untuk akun Professional dan rentang tanggal tersebut."
             )
         else:
             full_index = pd.date_range(pd.Timestamp(ctx.start), pd.Timestamp(ctx.end), freq="D")
-            plot = follower_trend.reindex(full_index, fill_value=0)
+            # Biarkan tanggal tanpa respons sebagai kosong, bukan angka 0 palsu.
+            plot = follower_trend.reindex(full_index)
             plot.index.name = "Tanggal"
-            st.caption("Perubahan bersih harian = follows baru − unfollows. Nilai positif berarti naik.")
-            st.line_chart(plot[["Perubahan bersih"]], height=280)
-            with st.expander("Rincian follows dan unfollows", expanded=False):
+            st.caption(
+                "Grafik menunjukkan jumlah follower baru per hari dari metric follower_count. "
+                "Ini bukan net growth karena data unfollows harian tidak tersedia pada respons yang diuji."
+            )
+            st.line_chart(plot[["Follower baru"]], height=280)
+            with st.expander("Rincian follower baru harian", expanded=False):
                 detail = plot.rename_axis("Tanggal").reset_index()
                 detail["Tanggal"] = detail["Tanggal"].dt.strftime("%d %b %Y")
+                detail["Follower baru"] = detail["Follower baru"].map(
+                    lambda value: "-" if pd.isna(value) else idn(value)
+                )
                 st.dataframe(detail, hide_index=True, width="stretch")
 
     if campaigns.empty:
