@@ -454,24 +454,32 @@ def _spn_registrations(start: str, end: str, csv_path: str) -> int | None:
     return int(emails[valid].nunique())
 
 
+def _find_leads_xlsx(name: str) -> Path | None:
+    """Cari file Excel leads internal; tidak di-cache supaya file baru langsung terdeteksi."""
+    path = Path(name)
+    if path.is_absolute():
+        return path if path.is_file() else None
+    here = Path(__file__).resolve().parent
+    folders = [Path.cwd(), here, here.parent]
+    found = next((f / path for f in folders if (f / path).is_file()), None)
+    if found is None:  # toleran terhadap beda nama (spasi / underscore)
+        found = next((m for f in folders for m in sorted(f.glob("LEADS*INTERNAL*SPN*.xlsx"))), None)
+    return found
+
+
 @st.cache_data(ttl=600, show_spinner=False)
-def _leads_chat_counts(start: str, end: str, xlsx_path: str) -> dict | None:
-    """Hitung chat masuk WA, chat masuk IG, dan leads sampai meeting (status HOT) dari Excel internal SPN pada periode yang sama."""
-    path = Path(xlsx_path)
-    if not path.is_absolute():
-        here = Path(__file__).resolve().parent
-        folders = [Path.cwd(), here, here.parent]
-        found = next((f / path for f in folders if (f / path).is_file()), None)
-        if found is None:  # toleran terhadap beda nama (spasi / underscore)
-            found = next((m for f in folders for m in sorted(f.glob("LEADS*INTERNAL*SPN*.xlsx"))), None)
-        path = found or (folders[0] / path)
-    if not path.is_file():
-        return None
+def _leads_chat_counts(start: str, end: str, xlsx_path: str, mtime: float) -> dict:
+    """Hitung chat masuk WA, chat masuk IG, dan leads sampai meeting (status HOT) pada periode yang sama.
+
+    Mengembalikan {"error": "..."} kalau gagal baca, supaya penyebabnya tampil di dashboard.
+    """
     try:
-        wa = pd.read_excel(path, sheet_name="Leads masuk", usecols=["Tanggal", "Status"])
-        ig = pd.read_excel(path, sheet_name="Leads - DM IG", usecols=["Tanggal"])
-    except (ValueError, KeyError, OSError, ImportError):
-        return None
+        wa = pd.read_excel(xlsx_path, sheet_name="Leads masuk", usecols=["Tanggal", "Status"])
+        ig = pd.read_excel(xlsx_path, sheet_name="Leads - DM IG", usecols=["Tanggal"])
+    except ImportError:
+        return {"error": "Library openpyxl belum ter-install di server. Tambahkan 'openpyxl' ke requirements.txt lalu push."}
+    except (ValueError, KeyError, OSError) as exc:
+        return {"error": f"Gagal membaca sheet 'Leads masuk' / 'Leads - DM IG' (kolom Tanggal & Status): {exc}"}
     low, high = pd.Timestamp(start), pd.Timestamp(end) + pd.Timedelta(days=1)
 
     def in_range(col):
@@ -670,13 +678,21 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         ("Impressions", idn(impressions), "Total tayangan dari campaign kategori ini"),
         ("Reach", idn(reach), "Akumulasi reach per campaign; bisa ada overlap audiens"),
     ]
-    chat_counts = None
+    chat_counts, chat_error = None, None
     if category == "Leads":
-        chat_counts = _leads_chat_counts(str(ctx.start), str(ctx.end), str(cfg("LEADS_XLSX_PATH", "LEADS - INTERNAL SPN.xlsx")))
+        xlsx = _find_leads_xlsx(str(cfg("LEADS_XLSX_PATH", "LEADS - INTERNAL SPN.xlsx")))
+        if xlsx is None:
+            chat_error = "File 'LEADS - INTERNAL SPN.xlsx' tidak ditemukan di server. Pastikan ter-push ke folder meta_ads (atau isi LEADS_XLSX_PATH), lalu reboot app."
+        else:
+            res = _leads_chat_counts(str(ctx.start), str(ctx.end), str(xlsx), xlsx.stat().st_mtime)
+            if "error" in res:
+                chat_error = res["error"]
+            else:
+                chat_counts = res
         cards = leads_headline_items(campaigns) + leads_chat_items(chat_counts, spend)
     headline_cards(cards)
-    if category == "Leads" and chat_counts is None:
-        st.caption("File Excel leads internal belum terbaca. Pastikan 'LEADS - INTERNAL SPN.xlsx' ada di folder meta_ads (atau isi LEADS_XLSX_PATH) dengan sheet 'Leads masuk' dan 'Leads - DM IG'.")
+    if chat_error:
+        st.caption(chat_error)
 
     with st.container(border=True):
         st.markdown('<div class="section-title">Konversi ke Community</div>', unsafe_allow_html=True)
