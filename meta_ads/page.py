@@ -459,8 +459,12 @@ def _leads_chat_counts(start: str, end: str, xlsx_path: str) -> dict | None:
     """Hitung chat masuk WA, chat masuk IG, dan leads sampai meeting (status HOT) dari Excel internal SPN pada periode yang sama."""
     path = Path(xlsx_path)
     if not path.is_absolute():
-        candidates = [Path.cwd() / path, Path(__file__).resolve().parent.parent / path]
-        path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+        here = Path(__file__).resolve().parent
+        folders = [Path.cwd(), here, here.parent]
+        found = next((f / path for f in folders if (f / path).is_file()), None)
+        if found is None:  # toleran terhadap beda nama (spasi / underscore)
+            found = next((m for f in folders for m in sorted(f.glob("LEADS*INTERNAL*SPN*.xlsx"))), None)
+        path = found or (folders[0] / path)
     if not path.is_file():
         return None
     try:
@@ -666,14 +670,13 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         ("Impressions", idn(impressions), "Total tayangan dari campaign kategori ini"),
         ("Reach", idn(reach), "Akumulasi reach per campaign; bisa ada overlap audiens"),
     ]
+    chat_counts = None
     if category == "Leads":
-        cards = leads_headline_items(campaigns)
+        chat_counts = _leads_chat_counts(str(ctx.start), str(ctx.end), str(cfg("LEADS_XLSX_PATH", "LEADS - INTERNAL SPN.xlsx")))
+        cards = leads_headline_items(campaigns) + leads_chat_items(chat_counts, spend)
     headline_cards(cards)
-    if category == "Leads":
-        chat_counts = _leads_chat_counts(str(ctx.start), str(ctx.end), str(cfg("LEADS_XLSX_PATH", "LEADS_-_INTERNAL_SPN.xlsx")))
-        headline_cards(leads_chat_items(chat_counts, spend))
-        if chat_counts is None:
-            st.caption("File Excel leads internal belum terbaca. Pastikan LEADS_XLSX_PATH menunjuk ke LEADS_-_INTERNAL_SPN.xlsx (sheet 'Leads masuk' dan 'Leads - DM IG').")
+    if category == "Leads" and chat_counts is None:
+        st.caption("File Excel leads internal belum terbaca. Pastikan 'LEADS - INTERNAL SPN.xlsx' ada di folder meta_ads (atau isi LEADS_XLSX_PATH) dengan sheet 'Leads masuk' dan 'Leads - DM IG'.")
 
     with st.container(border=True):
         st.markdown('<div class="section-title">Konversi ke Community</div>', unsafe_allow_html=True)
