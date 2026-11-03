@@ -150,7 +150,7 @@ def graph(_client, version, path, params=(), paginate=True, token=None):
 
 def clear_meta_cache():
     """Hapus cache Meta Ads saja. Jangan pakai st.cache_data.clear(): itu ikut menghapus cache data SPN."""
-    for fn in (load_insights, load_campaigns, graph, _spn_registrations, _leads_chat_counts):
+    for fn in (load_insights, load_campaigns, graph, _spn_registrations, _spn_csv_coverage, _leads_chat_counts):
         fn.clear()
     st.session_state.pop("mx_full_report_files", None)
     st.session_state.pop("mx_full_report_files", None)
@@ -486,9 +486,15 @@ def _leads_chat_counts(start: str, end: str, xlsx_path: str, mtime: float) -> di
         dates = pd.to_datetime(col, errors="coerce")
         return (dates >= low) & (dates < high)
 
+    all_dates = pd.concat([pd.to_datetime(wa["Tanggal"], errors="coerce"),
+                           pd.to_datetime(ig["Tanggal"], errors="coerce")]).dropna()
     wa, ig = wa[in_range(wa["Tanggal"])], ig[in_range(ig["Tanggal"])]
     status = wa["Status"].astype(str).str.strip().str.upper()
-    return {"wa": int(len(wa)), "ig": int(len(ig)), "meeting": int((status == "HOT").sum())}
+    return {
+        "wa": int(len(wa)), "ig": int(len(ig)), "meeting": int((status == "HOT").sum()),
+        "first": all_dates.min().date() if not all_dates.empty else None,
+        "last": all_dates.max().date() if not all_dates.empty else None,
+    }
 
 
 def leads_chat_items(counts, spend):
@@ -506,6 +512,23 @@ def leads_chat_items(counts, spend):
         ("Cost per Leads IG", cost(ig), "Amount Spent dibagi chat IG"),
         ("Cost per Leads Meeting", cost(meet), "Amount Spent dibagi leads sampai meeting"),
     ]
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _spn_csv_coverage(csv_path: str):
+    """Rentang tanggal data pendaftar di CSV SPN, untuk menjelaskan kenapa suatu periode bernilai 0."""
+    path = Path(csv_path)
+    if not path.is_absolute():
+        candidates = [Path.cwd() / path, Path(__file__).resolve().parent.parent / path]
+        path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    if not path.is_file():
+        return None
+    try:
+        raw = pd.read_csv(path, encoding="utf-8-sig", usecols=["timestamp"])
+    except (ValueError, OSError, UnicodeError):
+        return None
+    dates = pd.to_datetime(raw["timestamp"], errors="coerce").dropna()
+    return None if dates.empty else (dates.min().date(), dates.max().date())
 
 
 def _ad_follow_series(frame: pd.DataFrame) -> pd.Series:
@@ -693,6 +716,11 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
     headline_cards(cards)
     if chat_error:
         st.caption(chat_error)
+    elif chat_counts and chat_counts["wa"] + chat_counts["ig"] == 0 and chat_counts.get("first"):
+        st.caption(
+            f"Data chat di Excel hanya mencakup {chat_counts['first']:%d %b %Y} – {chat_counts['last']:%d %b %Y}. "
+            "Periode di luar rentang itu otomatis 0; tambahkan baris baru di Excel kalau mau data terbaru."
+        )
 
     with st.container(border=True):
         st.markdown('<div class="section-title">Konversi ke Community</div>', unsafe_allow_html=True)
@@ -704,6 +732,14 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         if registrations is None:
             st.warning("Data pendaftar belum terbaca. Pastikan file CSV tersedia dan memiliki kolom timestamp serta email.")
 
+    if registrations == 0:
+        coverage = _spn_csv_coverage(csv_path)
+        if coverage:
+            st.caption(
+                f"Data pendaftar di CSV SPN hanya mencakup {coverage[0]:%d %b %Y} – {coverage[1]:%d %b %Y}. "
+                "Periode di luar rentang itu otomatis 0; update file CSV-nya kalau mau data terbaru."
+            )
+
     if category == "Leads" and registrations is not None and meta_lead_results <= 0:
         st.caption("Meta belum mengembalikan action Leads untuk campaign pada periode ini; Total Join Community tetap dihitung dari email unik SPN.")
 
@@ -713,7 +749,11 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         else:
             if follower_error:
                 st.caption(follower_error)
-            full_index = pd.date_range(pd.Timestamp(ctx.start), pd.Timestamp(ctx.end), freq="D")
+            idx_start, idx_end = pd.Timestamp(ctx.start), pd.Timestamp(ctx.end)
+            if (ctx.end - ctx.start).days > 45:  # rentang panjang: cukup tampilkan jendela yang tersedia
+                idx_start = max(idx_start, follower_trend.index.min())
+                idx_end = min(idx_end, follower_trend.index.max())
+            full_index = pd.date_range(idx_start, idx_end, freq="D")
             # Biarkan tanggal tanpa respons sebagai kosong, bukan angka 0 palsu.
             plot = follower_trend.reindex(full_index)
             plot.index.name = "Tanggal"
@@ -911,7 +951,7 @@ def render_admin(ctx: Ctx):
 def period_filter(account: str, version: str):
     """Pilihan periode praktis dengan rentang tanggal kustom bila diperlukan."""
     today = date.today()
-    presets = ["Bulan ini", "7 hari terakhir", "30 hari terakhir", "Bulan lalu", "Pilih tanggal"]
+    presets = ["Bulan ini", "7 hari terakhir", "30 hari terakhir", "Bulan lalu", "Semua waktu", "Pilih tanggal"]
     with st.container(border=True):
         c_period, c_dates, c_refresh = st.columns([1.2, 2.6, 0.9], vertical_alignment="bottom")
         preset = c_period.selectbox("Periode", presets, index=0, key="mx_period_preset_v3")
@@ -922,6 +962,14 @@ def period_filter(account: str, version: str):
         elif preset == "Bulan lalu":
             last_day = today.replace(day=1) - timedelta(days=1)
             start, end = last_day.replace(day=1), last_day
+        elif preset == "Semua waktu":
+            # Meta Insights hanya menyimpan sekitar 37 bulan; titik awal bisa diatur lewat ALL_TIME_START.
+            earliest = today - timedelta(days=36 * 30)
+            try:
+                configured = date.fromisoformat(str(cfg("ALL_TIME_START", "2024-08-01")))
+            except ValueError:
+                configured = earliest
+            start, end = max(configured, earliest), today
         elif preset == "Pilih tanggal":
             default_range = (today - timedelta(days=29), today)
             values = c_dates.date_input("Rentang tanggal", value=default_range, key="mx_custom_date_range_v3")
