@@ -150,7 +150,7 @@ def graph(_client, version, path, params=(), paginate=True, token=None):
 
 def clear_meta_cache():
     """Hapus cache Meta Ads saja. Jangan pakai st.cache_data.clear(): itu ikut menghapus cache data SPN."""
-    for fn in (load_insights, load_campaigns, graph, _spn_registrations, _spn_csv_coverage, _leads_chat_counts):
+    for fn in (load_insights, load_campaigns, graph, _spn_registrations, _spn_csv_coverage, _leads_internal_summary):
         fn.clear()
     st.session_state.pop("mx_full_report_files", None)
     st.session_state.pop("mx_full_report_files", None)
@@ -288,7 +288,7 @@ def leads_headline_items(df):
     ]
 
 
-def headline_cards(items):
+def headline_cards(items, cols=None, group=None):
     """Kartu headline dengan gaya visual yang sama seperti halaman Ringkasan SPN."""
     accents = ["#D91A7D", "#4A7CD9", "#2D9C9A", "#E2A13A", "#5F64D8", "#4797D3", "#47A36B", "#D97757"]
     cells = []
@@ -302,7 +302,9 @@ def headline_cards(items):
             f'<div class="mx-kpi-value">{html_lib.escape(str(value))}</div>'
             f'<div class="mx-kpi-note">{html_lib.escape(str(note))}</div></div>'
         )
-    st.markdown('<div class="mx-kpis">' + ''.join(cells) + '</div>', unsafe_allow_html=True)
+    head = f'<div class="mx-kpi-group">{html_lib.escape(str(group))}</div>' if group else ""
+    cls = f"mx-kpis mx-flex mx-n{int(cols)}" if cols else "mx-kpis"
+    st.markdown(head + f'<div class="{cls}">' + ''.join(cells) + '</div>', unsafe_allow_html=True)
 
 
 def category_frame(df, category):
@@ -468,49 +470,64 @@ def _find_leads_xlsx(name: str) -> Path | None:
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def _leads_chat_counts(start: str, end: str, xlsx_path: str, mtime: float) -> dict:
-    """Hitung chat masuk WA, chat masuk IG, dan leads sampai meeting (status HOT) pada periode yang sama.
+def _leads_internal_summary(xlsx_path: str, mtime: float) -> dict:
+    """Baca sheet 'Total Keseluruhan': chat WA, chat IG, leads HOT (sampai meeting), dan Budget Spending.
 
+    Ini total keseluruhan dari Excel, jadi tidak mengikuti filter periode dashboard.
     Mengembalikan {"error": "..."} kalau gagal baca, supaya penyebabnya tampil di dashboard.
     """
     try:
-        wa = pd.read_excel(xlsx_path, sheet_name="Leads masuk", usecols=["Tanggal", "Status"])
-        ig = pd.read_excel(xlsx_path, sheet_name="Leads - DM IG", usecols=["Tanggal"])
+        df = pd.read_excel(xlsx_path, sheet_name="Total Keseluruhan")
     except ImportError:
         return {"error": "Library openpyxl belum ter-install di server. Tambahkan 'openpyxl' ke requirements.txt lalu push."}
     except (ValueError, KeyError, OSError) as exc:
-        return {"error": f"Gagal membaca sheet 'Leads masuk' / 'Leads - DM IG' (kolom Tanggal & Status): {exc}"}
-    low, high = pd.Timestamp(start), pd.Timestamp(end) + pd.Timedelta(days=1)
+        return {"error": f"Gagal membaca sheet 'Total Keseluruhan': {exc}"}
+    needed = {"Chat Masuk", "Kategori", "Jumlah Leads"}
+    if not needed.issubset(df.columns):
+        return {"error": "Sheet 'Total Keseluruhan' harus punya kolom 'Chat Masuk', 'Kategori', dan 'Jumlah Leads'."}
 
-    def in_range(col):
-        dates = pd.to_datetime(col, errors="coerce")
-        return (dates >= low) & (dates < high)
+    channel, wa, ig, meeting = None, 0.0, 0.0, 0.0
+    for _, row in df.iterrows():
+        label = row["Chat Masuk"]
+        label = str(label).strip().lower() if pd.notna(label) else ""
+        if label.startswith("whatsapp"):
+            channel = "wa"
+        elif label.startswith("dm ig"):
+            channel = "ig"
+        elif label:  # 'Total', 'WA + IG', 'Leads Selisih', dst. menutup blok channel
+            channel = None
+        category = row["Kategori"]
+        category = str(category).strip().lower() if pd.notna(category) else ""
+        count = pd.to_numeric(row["Jumlah Leads"], errors="coerce")
+        if channel and category and pd.notna(count):
+            if channel == "wa":
+                wa += float(count)
+                if category == "hot":
+                    meeting += float(count)
+            else:
+                ig += float(count)
+    budget = None
+    if "Budget Spending" in df.columns:
+        values = pd.to_numeric(df["Budget Spending"], errors="coerce").dropna()
+        budget = float(values.iloc[0]) if not values.empty else None
+    return {"wa": int(wa), "ig": int(ig), "meeting": int(meeting), "budget": budget}
 
-    all_dates = pd.concat([pd.to_datetime(wa["Tanggal"], errors="coerce"),
-                           pd.to_datetime(ig["Tanggal"], errors="coerce")]).dropna()
-    wa, ig = wa[in_range(wa["Tanggal"])], ig[in_range(ig["Tanggal"])]
-    status = wa["Status"].astype(str).str.strip().str.upper()
-    return {
-        "wa": int(len(wa)), "ig": int(len(ig)), "meeting": int((status == "HOT").sum()),
-        "first": all_dates.min().date() if not all_dates.empty else None,
-        "last": all_dates.max().date() if not all_dates.empty else None,
-    }
 
-
-def leads_chat_items(counts, spend):
-    """Kartu chat masuk (WA, IG, sampai meeting) beserta cost per leads masing-masing."""
-    wa = counts["wa"] if counts else None
-    ig = counts["ig"] if counts else None
-    meet = counts["meeting"] if counts else None
-    cost = lambda n: rp(div(spend, n)) if n else "-"
+def leads_chat_items(summary):
+    """Kartu chat masuk (WA, IG, sampai meeting) dan cost per leads masing-masing dari Excel internal."""
+    wa = summary["wa"] if summary else None
+    ig = summary["ig"] if summary else None
+    meet = summary["meeting"] if summary else None
+    budget = summary.get("budget") if summary else None
+    cost = lambda n: rp(div(budget, n)) if n and budget else "-"
     show = lambda n: idn(n) if n is not None else "-"
     return [
-        ("Chat Masuk ke WA", show(wa), "Leads WhatsApp pada periode ini"),
-        ("Chat Masuk ke IG", show(ig), "Leads DM IG SPN pada periode ini"),
+        ("Chat Masuk ke WA", show(wa), "Total leads WhatsApp"),
+        ("Chat Masuk ke IG", show(ig), "Total leads DM IG SPN"),
         ("Chat Leads sampai Meeting", show(meet), "Leads status HOT (WhatsApp)"),
-        ("Cost per Leads WA", cost(wa), "Amount Spent dibagi chat WA"),
-        ("Cost per Leads IG", cost(ig), "Amount Spent dibagi chat IG"),
-        ("Cost per Leads Meeting", cost(meet), "Amount Spent dibagi leads sampai meeting"),
+        ("Cost per Leads WA", cost(wa), "Budget Spending ÷ chat WA"),
+        ("Cost per Leads IG", cost(ig), "Budget Spending ÷ chat IG"),
+        ("Cost per Leads Meeting", cost(meet), "Budget Spending ÷ leads meeting"),
     ]
 
 
@@ -701,26 +718,25 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         ("Impressions", idn(impressions), "Total tayangan dari campaign kategori ini"),
         ("Reach", idn(reach), "Akumulasi reach per campaign; bisa ada overlap audiens"),
     ]
-    chat_counts, chat_error = None, None
+    chat_summary, chat_error = None, None
     if category == "Leads":
         xlsx = _find_leads_xlsx(str(cfg("LEADS_XLSX_PATH", "LEADS - INTERNAL SPN.xlsx")))
         if xlsx is None:
             chat_error = "File 'LEADS - INTERNAL SPN.xlsx' tidak ditemukan di server. Pastikan ter-push ke folder meta_ads (atau isi LEADS_XLSX_PATH), lalu reboot app."
         else:
-            res = _leads_chat_counts(str(ctx.start), str(ctx.end), str(xlsx), xlsx.stat().st_mtime)
+            res = _leads_internal_summary(str(xlsx), xlsx.stat().st_mtime)
             if "error" in res:
                 chat_error = res["error"]
             else:
-                chat_counts = res
-        cards = leads_headline_items(campaigns) + leads_chat_items(chat_counts, spend)
-    headline_cards(cards)
+                chat_summary = res
+        headline_cards(leads_headline_items(campaigns), cols=5,
+                       group=f"Meta Ads · {ctx.start:%d %b %Y} – {ctx.end:%d %b %Y}")
+        headline_cards(leads_chat_items(chat_summary), cols=6,
+                       group="Leads internal · data Excel (total keseluruhan, tidak ikut filter periode)")
+    else:
+        headline_cards(cards)
     if chat_error:
         st.caption(chat_error)
-    elif chat_counts and chat_counts["wa"] + chat_counts["ig"] == 0 and chat_counts.get("first"):
-        st.caption(
-            f"Data chat di Excel hanya mencakup {chat_counts['first']:%d %b %Y} – {chat_counts['last']:%d %b %Y}. "
-            "Periode di luar rentang itu otomatis 0; tambahkan baris baru di Excel kalau mau data terbaru."
-        )
 
     with st.container(border=True):
         st.markdown('<div class="section-title">Konversi ke Community</div>', unsafe_allow_html=True)
@@ -1925,8 +1941,14 @@ META_CSS = """
 .mx-kpi-value { color:var(--navy,#1A1464); font-size:1.42rem; font-weight:800; line-height:1.3;
   letter-spacing:-.02em; margin-top:.14rem; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
 .mx-kpi-note { color:var(--muted,#55608A); font-size:.76rem; line-height:1.35; margin-top:.2rem; min-height:1.05rem; }
-@media (max-width:1100px) { .mx-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+.mx-kpi-group { color:var(--muted,#55608A); font-size:.72rem; font-weight:700; letter-spacing:.06em;
+  text-transform:uppercase; margin:.15rem 0 .5rem; }
+.mx-kpis.mx-flex { --g:.9rem; display:flex; flex-wrap:wrap; justify-content:center; gap:var(--g); margin-top:0; }
+.mx-flex .mx-kpi { flex:0 0 calc((100% - var(--g)*(var(--n) - 1))/var(--n)); }
+.mx-n5 { --n:5; } .mx-n6 { --n:6; }
+@media (max-width:1100px) { .mx-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } .mx-n5, .mx-n6 { --n:3; } }
 @media (max-width:600px) { .mx-kpis { grid-template-columns:repeat(2,minmax(0,1fr)); gap:.55rem; }
+  .mx-kpis.mx-flex { --g:.55rem; } .mx-n5, .mx-n6 { --n:2; }
   .mx-kpi { padding:.72rem .75rem; } .mx-kpi-value { font-size:1.15rem; } }
 </style>
 """
