@@ -732,7 +732,7 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         headline_cards(leads_headline_items(campaigns), cols=5,
                        group=f"Meta Ads · {ctx.start:%d %b %Y} – {ctx.end:%d %b %Y}")
         headline_cards(leads_chat_items(chat_summary), cols=6,
-                       group="Leads internal · data Excel (total keseluruhan, tidak ikut filter periode)")
+                       group="Leads internal")
     else:
         headline_cards(cards)
     if chat_error:
