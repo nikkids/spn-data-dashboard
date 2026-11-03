@@ -256,6 +256,38 @@ def primary_action_per_campaign(df, action_type):
     return maps.map(lambda m: float(m.get(action_type, 0) or 0))
 
 
+MSG_ACTION_PREFERRED = "onsite_conversion.messaging_conversation_started_7d"
+
+
+def message_action_choice(df):
+    """Action 'message conversation started' yang sama dengan kolom Results di Ads Manager (tanpa dijumlah lintas tipe)."""
+    totals = action_totals(df)
+    if totals.empty:
+        return None
+    if MSG_ACTION_PREFERRED in totals.index:
+        return MSG_ACTION_PREFERRED
+    found = [t for t in totals.index if "messaging_conversation_started" in str(t).lower()]
+    return found[0] if found else None
+
+
+def leads_headline_items(df):
+    """5 headline khusus submenu Leads: Amount Spent, Reach, Link Clicks, Results, Cost per Result."""
+    empty = df is None or df.empty
+    spend = _series_sum(df, "spend")
+    reach = _series_sum(df, "reach")
+    link_clicks = _series_sum(df, "inline_link_clicks")
+    action = None if empty else message_action_choice(df)
+    results = float(primary_action_per_campaign(df, action).sum()) if action else None
+    cost_per_result = div(spend, results) if results else None
+    return [
+        ("Amount Spent", rp(spend), "Total belanja iklan campaign Leads"),
+        ("Reach", idn(reach), "Akumulasi reach per campaign; bisa ada overlap audiens"),
+        ("Link Clicks", idn(link_clicks), "Klik tautan pada iklan (inline link clicks)"),
+        ("Results", idn(results) if results is not None else "-", "Message conversation yang dimulai"),
+        ("Cost per Result", rp(cost_per_result) if cost_per_result else "-", "Amount spent dibagi Results"),
+    ]
+
+
 def headline_cards(items):
     """Kartu headline dengan gaya visual yang sama seperti halaman Ringkasan SPN."""
     accents = ["#D91A7D", "#4A7CD9", "#2D9C9A", "#E2A13A", "#5F64D8", "#4797D3", "#47A36B", "#D97757"]
@@ -581,7 +613,7 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
 
     follower_total, follower_trend, follower_error = _instagram_profile_and_trend(ctx)
 
-    headline_cards([
+    cards = [
         (first_kpi_label, idn(result) if result is not None else "-", result_label),
         (cost_kpi_label, rp(cost_per_result), cost_kpi_note),
         ("Follower By Ads", idn(ad_follows), "Follow yang dilaporkan Meta dari campaign ini"),
@@ -591,7 +623,10 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
         ("Total Spend", rp(spend), f"{category} · {ctx.start:%d %b %Y} – {ctx.end:%d %b %Y}"),
         ("Impressions", idn(impressions), "Total tayangan dari campaign kategori ini"),
         ("Reach", idn(reach), "Akumulasi reach per campaign; bisa ada overlap audiens"),
-    ])
+    ]
+    if category == "Leads":
+        cards = leads_headline_items(campaigns)
+    headline_cards(cards)
 
     with st.container(border=True):
         st.markdown('<div class="section-title">Konversi ke Community</div>', unsafe_allow_html=True)
