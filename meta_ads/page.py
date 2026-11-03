@@ -150,7 +150,7 @@ def graph(_client, version, path, params=(), paginate=True, token=None):
 
 def clear_meta_cache():
     """Hapus cache Meta Ads saja. Jangan pakai st.cache_data.clear(): itu ikut menghapus cache data SPN."""
-    for fn in (load_insights, load_campaigns, graph, _spn_registrations):
+    for fn in (load_insights, load_campaigns, graph, _spn_registrations, _leads_chat_counts):
         fn.clear()
     st.session_state.pop("mx_full_report_files", None)
     st.session_state.pop("mx_full_report_files", None)
@@ -454,6 +454,48 @@ def _spn_registrations(start: str, end: str, csv_path: str) -> int | None:
     return int(emails[valid].nunique())
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _leads_chat_counts(start: str, end: str, xlsx_path: str) -> dict | None:
+    """Hitung chat masuk WA, chat masuk IG, dan leads sampai meeting (status HOT) dari Excel internal SPN pada periode yang sama."""
+    path = Path(xlsx_path)
+    if not path.is_absolute():
+        candidates = [Path.cwd() / path, Path(__file__).resolve().parent.parent / path]
+        path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    if not path.is_file():
+        return None
+    try:
+        wa = pd.read_excel(path, sheet_name="Leads masuk", usecols=["Tanggal", "Status"])
+        ig = pd.read_excel(path, sheet_name="Leads - DM IG", usecols=["Tanggal"])
+    except (ValueError, KeyError, OSError, ImportError):
+        return None
+    low, high = pd.Timestamp(start), pd.Timestamp(end) + pd.Timedelta(days=1)
+
+    def in_range(col):
+        dates = pd.to_datetime(col, errors="coerce")
+        return (dates >= low) & (dates < high)
+
+    wa, ig = wa[in_range(wa["Tanggal"])], ig[in_range(ig["Tanggal"])]
+    status = wa["Status"].astype(str).str.strip().str.upper()
+    return {"wa": int(len(wa)), "ig": int(len(ig)), "meeting": int((status == "HOT").sum())}
+
+
+def leads_chat_items(counts, spend):
+    """Kartu chat masuk (WA, IG, sampai meeting) beserta cost per leads masing-masing."""
+    wa = counts["wa"] if counts else None
+    ig = counts["ig"] if counts else None
+    meet = counts["meeting"] if counts else None
+    cost = lambda n: rp(div(spend, n)) if n else "-"
+    show = lambda n: idn(n) if n is not None else "-"
+    return [
+        ("Chat Masuk ke WA", show(wa), "Leads WhatsApp pada periode ini"),
+        ("Chat Masuk ke IG", show(ig), "Leads DM IG SPN pada periode ini"),
+        ("Chat Leads sampai Meeting", show(meet), "Leads status HOT (WhatsApp)"),
+        ("Cost per Leads WA", cost(wa), "Amount Spent dibagi chat WA"),
+        ("Cost per Leads IG", cost(ig), "Amount Spent dibagi chat IG"),
+        ("Cost per Leads Meeting", cost(meet), "Amount Spent dibagi leads sampai meeting"),
+    ]
+
+
 def _ad_follow_series(frame: pd.DataFrame) -> pd.Series:
     """Jumlah follow Meta per campaign, memakai field native lalu fallback ke actions."""
     if frame is None:
@@ -627,6 +669,11 @@ def render_stats(ctx: Ctx, category, raw_campaigns):
     if category == "Leads":
         cards = leads_headline_items(campaigns)
     headline_cards(cards)
+    if category == "Leads":
+        chat_counts = _leads_chat_counts(str(ctx.start), str(ctx.end), str(cfg("LEADS_XLSX_PATH", "LEADS_-_INTERNAL_SPN.xlsx")))
+        headline_cards(leads_chat_items(chat_counts, spend))
+        if chat_counts is None:
+            st.caption("File Excel leads internal belum terbaca. Pastikan LEADS_XLSX_PATH menunjuk ke LEADS_-_INTERNAL_SPN.xlsx (sheet 'Leads masuk' dan 'Leads - DM IG').")
 
     with st.container(border=True):
         st.markdown('<div class="section-title">Konversi ke Community</div>', unsafe_allow_html=True)
